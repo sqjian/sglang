@@ -128,8 +128,7 @@ class CommonKVManager(BaseKVManager):
             self.is_dummy_cp_rank = (
                 is_mla_backend and self.attn_cp_size > 1 and self.attn_cp_rank != 0
             )
-            if not self.is_dummy_cp_rank:
-                self.register_to_bootstrap()
+            self.register_to_bootstrap()
             self.transfer_infos = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -702,6 +701,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ):
             return False
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
+        logger.debug(
+            f"Expected {expected} prefill servers to be registered, {self._registered_count} registered so far"
+        )
         return self._registered_count >= expected
 
     def _setup_routes(self):
