@@ -1894,6 +1894,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """True if this rank runs sampling (last PP stage) and multiple ranks would contend on sampling.lock (#19583)."""
         if self.server_args.sampling_backend != "flashinfer":
             return False
+        # Decode node (PD disaggregation): no need to run; avoid redundant warmup on decode-only service.
+        if self.server_args.disaggregation_mode == "decode":
+            return False
         if self.pp_rank != self.pp_size - 1:
             return False
         if self.pp_size == 1 and self.tp_size == 1:
