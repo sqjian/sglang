@@ -1897,8 +1897,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Decode node (PD disaggregation): no need to run; avoid redundant warmup on decode-only service.
         if self.server_args.disaggregation_mode == "decode":
             return False
-        if self.pp_rank != self.pp_size - 1:
-            return False
         if self.pp_size == 1 and self.tp_size == 1:
             return False
         return True
@@ -1907,10 +1905,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Pre-populate FlashInfer sampling JIT cache; serialize by tp_rank to avoid sampling.lock contention."""
         from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
-        logger.info("Running FlashInfer sampling warmup (last PP stage)...")
+        # Only the last PP rank actually runs sampling, but all ranks participate in barriers
+        is_last_pp_rank = self.pp_rank == self.pp_size - 1
+        
+        if is_last_pp_rank:
+            logger.info("Running FlashInfer sampling warmup (last PP stage)...")
+        
         for step in range(self.tp_size):
             self.tp_group.barrier()
-            if self.tp_rank == step:
+            if self.tp_rank == step and is_last_pp_rank:
                 with torch.inference_mode():
                     batch_size = 2
                     vocab_size = 128
@@ -1932,7 +1935,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         check_nan=False,
                     )
             self.tp_group.barrier()
-        logger.info("FlashInfer sampling warmup completed.")
+        
+        if is_last_pp_rank:
+            logger.info("FlashInfer sampling warmup completed.")
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
