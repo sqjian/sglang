@@ -224,6 +224,8 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            if entry.is_primary_index_anchor:
+                continue
             self.storage_backend.register_mem_host_pool_v2(
                 entry.host_pool, _pool_name_key(entry.name)
             )
