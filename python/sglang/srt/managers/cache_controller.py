@@ -261,10 +261,16 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
-        self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -274,6 +280,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.enable_storage_metrics = enable_storage_metrics
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -571,6 +578,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -603,7 +612,8 @@ class HiCacheController:
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
-            is_page_first_layout=self.mem_pool_host.layout == "page_first",
+            enable_storage_metrics=self.enable_storage_metrics,
+            layout=self.mem_pool_host.layout,
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
@@ -817,6 +827,50 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
+    @staticmethod
+    def _count_consecutive_true(results: List[bool]) -> int:
+        for i, ok in enumerate(results):
+            if not ok:
+                return i
+        return len(results)
+
+    def _kv_get_pages(self, hash_values, host_indices, extra_info=None) -> int:
+        if self.storage_backend_type == "mooncake":
+            results = self.storage_backend.batch_get_v1(
+                hash_values, host_indices, extra_info
+            )
+            return self._count_consecutive_true(results)
+
+        dummy_page_dst = [
+            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+        ]
+        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+        if page_data is None:
+            return 0
+        success_pages = 0
+        for i in range(len(hash_values)):
+            if page_data[i] is None:
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * self.page_size], page_data[i]
+            )
+            success_pages += 1
+        return success_pages
+
+    def _kv_set_pages(self, hash_values, host_indices, extra_info=None) -> bool:
+        if self.storage_backend_type == "mooncake":
+            return all(
+                self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+            )
+        data = [
+            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(hash_values))
+        ]
+        return self.storage_backend.batch_set(hash_values, data)
+
+    def _storage_hit_page_num(self, batch_hashes, extra_info=None) -> int:
+        return self.storage_backend.batch_exists(batch_hashes, extra_info)
+
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
         dummy_page_dst = [
@@ -912,7 +966,7 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            hit_page_num = self._storage_hit_page_num(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
