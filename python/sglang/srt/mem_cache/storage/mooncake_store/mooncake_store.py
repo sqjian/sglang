@@ -481,9 +481,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        assert self.store.put(warmup_key, warmup_value) == 0
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        put_ret = self.store.put(warmup_key, warmup_value)
+        if put_ret != 0:
+            logger.error("Mooncake store warmup put failed: key=%s, ret_code=%s", warmup_key, put_ret)
+        assert put_ret == 0, f"Mooncake store warmup put failed with ret_code={put_ret}"
+        exist_ret = self.store.is_exist(warmup_key)
+        if exist_ret != 1:
+            logger.error("Mooncake store warmup is_exist failed: key=%s, ret=%s", warmup_key, exist_ret)
+        assert exist_ret == 1, f"Mooncake store warmup is_exist failed with ret={exist_ret}"
+        get_ret = self.store.get(warmup_key)
+        if get_ret != warmup_value:
+            logger.error("Mooncake store warmup get mismatch: key=%s, got_len=%s, expected_len=%s", warmup_key, len(get_ret) if get_ret else None, len(warmup_value))
+        assert get_ret == warmup_value, "Mooncake store warmup get value mismatch"
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
