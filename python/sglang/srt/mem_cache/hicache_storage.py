@@ -51,6 +51,8 @@ class HiCacheStorageConfig:
     tp_size: int
     pp_rank: int
     pp_size: int
+    attn_cp_rank: int
+    attn_cp_size: int
     is_mla_model: bool
     enable_storage_metrics: bool
     layout: Literal["layer_first", "page_first", "page_first_direct", "page_head"]
