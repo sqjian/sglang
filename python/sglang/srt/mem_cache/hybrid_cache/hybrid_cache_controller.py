@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -517,15 +518,42 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
     def get_usable_prefetch_token_count(self, operation: PrefetchOperation) -> int:
-        usable_pages = operation.completed_tokens // self.page_size
+        completed_pages = operation.completed_tokens // self.page_size
+        usable_pages = completed_pages
+        pool_debug = []
         for transfer in operation.pool_transfers or []:
             if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
                 continue
+            pool_name = _pool_name_key(transfer.name)
+            pool_hit_pages = operation.pool_storage_result.extra_pool_hit_pages.get(
+                pool_name, 0
+            )
+            pool_debug.append(
+                {
+                    "pool": pool_name,
+                    "hit_pages": pool_hit_pages,
+                    "requested_keys": len(transfer.keys or []),
+                }
+            )
             usable_pages = min(
                 usable_pages,
-                operation.pool_storage_result.extra_pool_hit_pages.get(
-                    _pool_name_key(transfer.name), 0
-                ),
+                pool_hit_pages,
+            )
+        if os.getenv("SGLANG_DEBUG_HICACHE_USABLE_PREFETCH", "1") == "1":
+            logger.warning(
+                "[HiCacheUsablePrefetch] rid=%s completed_tokens=%s completed_pages=%s "
+                "usable_pages=%s usable_tokens=%s extra_pool_hit_pages=%s hash_pages=%s "
+                "pp=%s cp=%s tp=%s",
+                getattr(operation, "request_id", None),
+                operation.completed_tokens,
+                completed_pages,
+                usable_pages,
+                usable_pages * self.page_size,
+                pool_debug,
+                len(operation.hash_value),
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.tp_rank,
             )
         return usable_pages * self.page_size
 
