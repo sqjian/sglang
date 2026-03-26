@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -1113,6 +1114,34 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
+        if (
+            os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "1") == "1"
+            and self.cur_batch is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            req_lens = [
+                (
+                    req.rid,
+                    len(req.fill_ids),
+                    len(req.prefix_indices),
+                    req.host_hit_length,
+                    req.storage_hit_length,
+                    req.extend_input_len,
+                )
+                for req in self.cur_batch.reqs
+            ]
+            total_extend = sum(max(req.extend_input_len, 0) for req in self.cur_batch.reqs)
+            logger.warning(
+                "[PPShape] launch batch summary: mb_id=%s reqs=%s total_extend=%s "
+                "pp=%s cp=%s tp=%s lens=%s",
+                mb_id,
+                len(self.cur_batch.reqs),
+                total_extend,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                req_lens,
+            )
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.default_stream)

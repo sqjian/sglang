@@ -1222,6 +1222,7 @@ class HiRadixCache(RadixCache):
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
+        original_key_len = len(key)
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         key, _ = self.maybe_bigram_convert(key)
         if self.disable or len(key) == 0:
@@ -1235,6 +1236,8 @@ class HiRadixCache(RadixCache):
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
+        else:
+            page_aligned_len = len(key)
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -1249,6 +1252,29 @@ class HiRadixCache(RadixCache):
             last_node = last_node.parent
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+
+        if (
+            os.getenv("SGLANG_DEBUG_HICACHE_MATCH", "1") == "1"
+            and self.pp_size > 1
+        ):
+            req_id = params.req.rid if params.req is not None else None
+            logger.warning(
+                "[HiCacheMatch] rid=%s key_len=%s aligned_len=%s device_hit=%s "
+                "host_hit=%s total_cached=%s page_size=%s pp=%s cp=%s tp=%s "
+                "last_device_node=%s last_host_node=%s",
+                req_id,
+                original_key_len,
+                page_aligned_len,
+                len(value),
+                host_hit_length,
+                len(value) + host_hit_length,
+                self.page_size,
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                getattr(last_node, "id", None),
+                getattr(last_host_node, "id", None),
+            )
 
         return MatchResult(
             device_indices=value,

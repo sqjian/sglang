@@ -1003,6 +1003,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
+                if os.getenv("SGLANG_MOONCAKE_DEBUG_MISS_KEYS", "1") == "1":
+                    logger.warning(
+                        "[MooncakeStore] batch_exists miss: status=%s key=%s (idx=%s/%s) "
+                        "pp_rank=%s attn_cp_rank=%s tp_rank=%s is_mla=%s",
+                        exist_result[i],
+                        query_keys[i],
+                        i,
+                        len(query_keys),
+                        getattr(self, "pp_rank", None),
+                        getattr(self, "attn_cp_rank", None),
+                        getattr(self, "local_rank", None),
+                        getattr(self, "is_mla_backend", None),
+                    )
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 
@@ -1022,7 +1035,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        if os.getenv("SGLANG_MOONCAKE_DEBUG_MISS_KEYS", "1") == "1":
+            for i, ret in enumerate(results):
+                if ret < 0:
+                    logger.warning(
+                        "[MooncakeStore] batch_get_into failed: ret=%s key=%s (idx=%s/%s) "
+                        "pp_rank=%s attn_cp_rank=%s tp_rank=%s is_mla=%s",
+                        ret,
+                        key_strs[i],
+                        i,
+                        len(key_strs),
+                        getattr(self, "pp_rank", None),
+                        getattr(self, "attn_cp_rank", None),
+                        getattr(self, "local_rank", None),
+                        getattr(self, "is_mla_backend", None),
+                    )
+                    break
+        return results
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
