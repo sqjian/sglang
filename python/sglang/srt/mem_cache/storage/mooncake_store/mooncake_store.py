@@ -707,9 +707,49 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return [f"{key}_{suffix}_{pool_name_key}" for key in tagged_keys]
         return [f"{key}_{pool_name_key}" for key in tagged_keys]
 
-    def _batch_exists_for_pool(self, pool_name, keys: List[str]) -> int:
+    def _get_debug_rid(self, extra_info: Optional[HiCacheStorageExtraInfo]) -> Optional[str]:
+        if extra_info is None or extra_info.extra_info is None:
+            return None
+        return extra_info.extra_info.get("rid")
+
+    def _log_nsa_pool_keys(
+        self,
+        phase: str,
+        keys: List[str],
+        results: List[bool | int],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> None:
+        if os.getenv("SGLANG_DEBUG_NSA_STORAGE_KEYS", "1") != "1":
+            return
+        rid = self._get_debug_rid(extra_info)
+        for key, result in zip(keys, results):
+            ok = result if isinstance(result, bool) else (result == 1)
+            logger.warning(
+                "[NSAStorageKey] phase=%s rid=%s key=%s hit=%s pp=%s cp=%s tp=%s",
+                phase,
+                rid,
+                key,
+                ok,
+                getattr(self, "pp_rank", None),
+                getattr(self, "attn_cp_rank", None),
+                getattr(self, "local_rank", None),
+            )
+
+    def _batch_exists_for_pool(
+        self,
+        pool_name,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
         query_keys = self._get_pool_keys(pool_name, keys)
         exist_result = self._batch_exist(query_keys)
+        if _pool_name_key(pool_name) == PoolName.NSA.value:
+            self._log_nsa_pool_keys(
+                phase="batch_exists_v2",
+                keys=query_keys,
+                results=exist_result,
+                extra_info=extra_info,
+            )
         for i, status in enumerate(exist_result):
             if status != 1:
                 return i
@@ -733,15 +773,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             pool_name = _pool_name_key(transfer.name)
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 boundary = self._batch_exists_for_pool(
-                    transfer.name, keys[:kv_hit_pages]
+                    transfer.name, keys[:kv_hit_pages], extra_info
                 )
             else:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 boundary = 0
                 for prefix_len in range(kv_hit_pages, 0, -1):
                     trailing_keys = keys[max(0, prefix_len - trailing) : prefix_len]
-                    if self._batch_exists_for_pool(transfer.name, trailing_keys) == len(
-                        trailing_keys
+                    if (
+                        self._batch_exists_for_pool(
+                            transfer.name, trailing_keys, extra_info
+                        )
+                        == len(trailing_keys)
                     ):
                         boundary = prefix_len
                         break
@@ -806,6 +849,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 continue
 
             pool_results = [res > 0 for res in get_results]
+            if pool_name == PoolName.NSA.value:
+                self._log_nsa_pool_keys(
+                    phase="batch_get_v2",
+                    keys=key_strs,
+                    results=pool_results,
+                    extra_info=extra_info,
+                )
             if stage_pages is not None:
                 for i, ok in enumerate(pool_results):
                     if not ok:

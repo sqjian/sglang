@@ -427,7 +427,8 @@ class HybridCacheController(BaseHiCacheController):
             hash_value.append(last_hash)
 
         extra_info = HiCacheStorageExtraInfo(
-            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+            prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
+            extra_info={"rid": getattr(operation, "request_id", None)},
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -501,7 +502,12 @@ class HybridCacheController(BaseHiCacheController):
             kv_pages,
         )
         if transfers and not operation.is_terminated():
-            results = self.storage_backend.batch_get_v2(transfers)
+            results = self.storage_backend.batch_get_v2(
+                transfers,
+                extra_info=HiCacheStorageExtraInfo(
+                    extra_info={"rid": getattr(operation, "request_id", None)}
+                ),
+            )
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
     def _page_backup(self, operation):
