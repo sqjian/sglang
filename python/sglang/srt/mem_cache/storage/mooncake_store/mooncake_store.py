@@ -743,13 +743,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> int:
         query_keys = self._get_pool_keys(pool_name, keys)
         exist_result = self._batch_exist(query_keys)
-        if _pool_name_key(pool_name) == PoolName.NSA.value:
-            self._log_nsa_pool_keys(
-                phase="batch_exists_v2",
-                keys=query_keys,
-                results=exist_result,
-                extra_info=extra_info,
-            )
         for i, status in enumerate(exist_result):
             if status != 1:
                 return i
