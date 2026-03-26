@@ -111,8 +111,18 @@ class PoolTransferResult:
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
         for name, rs in results.items():
-            self.extra_pool_hit_pages[name] = self.extra_pool_hit_pages.get(name, 0) + (
-                self._count_consecutive_true(rs)
+            # `batch_exists_v2()` may already have established a lower bound for a
+            # pool. `batch_get_v2()` / `batch_set_v2()` should refine that bound,
+            # not add the same pages again.
+            self.extra_pool_hit_pages[name] = max(
+                self.extra_pool_hit_pages.get(name, 0),
+                self._count_consecutive_true(rs),
+            )
+
+    def update_extra_pool_hit_page_counts(self, counts: dict[str, int]) -> None:
+        for name, count in counts.items():
+            self.extra_pool_hit_pages[name] = max(
+                self.extra_pool_hit_pages.get(name, 0), count
             )
 
 
