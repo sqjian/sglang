@@ -1258,6 +1258,7 @@ class HiRadixCache(RadixCache):
             and self.pp_size > 1
         ):
             req_id = params.req.rid if params.req is not None else None
+            tp_rank = getattr(self.cache_controller, "tp_rank", None)
             logger.warning(
                 "[HiCacheMatch] rid=%s key_len=%s aligned_len=%s device_hit=%s "
                 "host_hit=%s total_cached=%s page_size=%s pp=%s cp=%s tp=%s "
@@ -1271,7 +1272,7 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 self.pp_rank,
                 self.attn_cp_rank,
-                self.attn_tp_rank,
+                tp_rank,
                 getattr(last_node, "id", None),
                 getattr(last_host_node, "id", None),
             )
