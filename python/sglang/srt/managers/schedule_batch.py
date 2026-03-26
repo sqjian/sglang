@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align
@@ -893,6 +895,19 @@ class Req(ReqDllmMixin):
                 match_result.mamba_branching_seqlen,
             )
             self.cache_protected_len = len(self.prefix_indices)
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "1") == "1":
+                logger.warning(
+                    "[HiCacheMatchChain] init_next_round_input: rid=%s fill_len=%s "
+                    "token_ids_len=%s matched_device=%s matched_host=%s prefix_len=%s "
+                    "cache_protected_len=%s",
+                    self.rid,
+                    len(self.fill_ids),
+                    len(token_ids),
+                    len(match_result.device_indices),
+                    match_result.host_hit_length,
+                    len(self.prefix_indices),
+                    self.cache_protected_len,
+                )
 
         if (
             self.is_retracted
