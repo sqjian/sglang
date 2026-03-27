@@ -233,6 +233,8 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
+        self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -1277,6 +1279,11 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def was_prefetch_skipped(self, req_id: str) -> bool:
+        """Return True if prefetch was skipped for this request
+        (host alloc failure, below threshold, or rate-limited)."""
+        return req_id in self.prefetch_skipped_rids
+
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         original_key_len = len(key)
@@ -1359,6 +1366,7 @@ class HiRadixCache(RadixCache):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
+            self.prefetch_skipped_rids.add(req_id)
             return
 
         last_host_node.protect_host()
@@ -1368,8 +1376,9 @@ class HiRadixCache(RadixCache):
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             last_host_node.release_host()
-            # no sufficient host memory for prefetch
+            self.prefetch_skipped_rids.add(req_id)
             return
+        self.prefetch_skipped_rids.discard(req_id)
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
@@ -1612,6 +1621,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_skipped_rids.discard(rid)
 
         if rid not in self.ongoing_prefetch:
             return

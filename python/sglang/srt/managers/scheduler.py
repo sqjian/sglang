@@ -2107,8 +2107,31 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
+                    if self.pp_size > 1:
+                        timeout_s = max(
+                            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1
+                        )
+                        wait_start = time.perf_counter()
+                        while not prefetch_done:
+                            if time.perf_counter() - wait_start >= timeout_s:
+                                logger.warning(
+                                    "[PPPrefetch] FIFO wait timeout: "
+                                    "rid=%s pp=%s cp=%s tp=%s",
+                                    req.rid,
+                                    self.pp_rank,
+                                    self.attn_cp_rank,
+                                    self.attn_tp_rank,
+                                )
+                                break
+                            self.tree_cache.check_hicache_events()
+                            time.sleep(0.001)
+                            prefetch_done = (
+                                self.tree_cache.check_prefetch_progress(req.rid)
+                            )
+                        if not prefetch_done:
+                            break
+                    else:
+                        continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
@@ -2854,6 +2877,21 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
+        # Handle chunked_req abort
+        if (
+            self.chunked_req is not None
+            and (recv_req.abort_all or self.chunked_req.rid.startswith(recv_req.rid))
+        ):
+            logger.debug(f"Abort chunked request. rid={self.chunked_req.rid}")
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and hasattr(self.chunked_req, "disagg_kv_sender")
+                and self.chunked_req.disagg_kv_sender is not None
+                and hasattr(self.chunked_req.disagg_kv_sender, "abort")
+            ):
+                self.chunked_req.disagg_kv_sender.abort()
+            self.chunked_req = None
+
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
@@ -2869,6 +2907,13 @@ class Scheduler(
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and hasattr(req, "disagg_kv_sender")
+                    and req.disagg_kv_sender is not None
+                    and hasattr(req.disagg_kv_sender, "abort")
+                ):
+                    req.disagg_kv_sender.abort()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

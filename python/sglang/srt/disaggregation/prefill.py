@@ -463,6 +463,17 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if req.req_pool_idx is None or req.finished():
+                if req.is_chunked <= 0:
+                    if (
+                        hasattr(req, "disagg_kv_sender")
+                        and req.disagg_kv_sender is not None
+                        and hasattr(req.disagg_kv_sender, "abort")
+                    ):
+                        req.disagg_kv_sender.abort()
+                    release_kv_cache(req, self.tree_cache)
+                continue
+
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -570,7 +581,15 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
-                assert poll == KVPoll.Success or poll == KVPoll.Failed
+                if poll not in (KVPoll.Success, KVPoll.Failed):
+                    logger.warning(
+                        "PP consensus rid %s has unexpected poll state %s, "
+                        "treating as undone",
+                        req.rid,
+                        poll,
+                    )
+                    undone_reqs.append(req)
+                    continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
@@ -598,7 +617,8 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                assert False, f"Unexpected polling state {poll=}"
+                logger.warning("Unexpected polling state %s for rid=%s", poll, req.rid)
+                undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -686,6 +706,9 @@ class SchedulerDisaggregationPrefillMixin:
         if not last_chunk:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
+
+        if start_idx >= end_idx and not last_chunk:
+            return
 
         kv_indices = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
