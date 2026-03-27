@@ -2139,7 +2139,7 @@ class Scheduler(
 
             req.init_next_round_input(self.tree_cache)
             if (
-                os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "1") == "1"
+                os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
                 and self.pp_size > 1
                 and self.disaggregation_mode == DisaggregationMode.PREFILL
             ):

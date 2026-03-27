@@ -1133,7 +1133,7 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
     ):
         if (
-            os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "1") == "1"
+            os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
             and self.cur_batch is not None
             and self.disaggregation_mode == DisaggregationMode.PREFILL
         ):

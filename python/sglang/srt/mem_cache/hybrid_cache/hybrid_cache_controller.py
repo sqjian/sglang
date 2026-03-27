@@ -553,7 +553,7 @@ class HybridCacheController(BaseHiCacheController):
                 usable_pages,
                 pool_hit_pages,
             )
-        if os.getenv("SGLANG_DEBUG_HICACHE_USABLE_PREFETCH", "1") == "1":
+        if os.getenv("SGLANG_DEBUG_HICACHE_USABLE_PREFETCH", "0") == "1":
             logger.warning(
                 "[HiCacheUsablePrefetch] rid=%s completed_tokens=%s completed_pages=%s "
                 "usable_pages=%s usable_tokens=%s extra_pool_hit_pages=%s hash_pages=%s "
