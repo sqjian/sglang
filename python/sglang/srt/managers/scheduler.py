@@ -1977,6 +1977,31 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def _pp_prefill_diag_enabled(self) -> bool:
+        return (
+            os.getenv("SGLANG_DEBUG_PP_PREFILL_DIAG", "0") == "1"
+            and self.pp_size > 1
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+        )
+
+    def _pp_prefill_diag_req(self, req: Req) -> str:
+        prefix_indices = getattr(req, "prefix_indices", None)
+        prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+        return (
+            f"{req.rid}"
+            f"(prefix={prefix_len}"
+            f",host={getattr(req, 'host_hit_length', None)}"
+            f",storage={getattr(req, 'storage_hit_length', None)}"
+            f",extend={getattr(req, 'extend_input_len', None)}"
+            f",chunked={getattr(req, 'is_chunked', None)})"
+        )
+
+    def _pp_prefill_diag_queue(self, reqs: List[Req], limit: int = 8) -> List[str]:
+        snapshot = [self._pp_prefill_diag_req(req) for req in reqs[:limit]]
+        if len(reqs) > limit:
+            snapshot.append(f"...(+{len(reqs) - limit})")
+        return snapshot
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -2063,6 +2088,21 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
+        diag_enabled = self._pp_prefill_diag_enabled()
+        diag_stop_reason = "selected"
+        if diag_enabled:
+            logger.warning(
+                "[PPPrefillDiag][enter] pp=%s cp=%s tp=%s waiting=%s bootstrap=%s "
+                "inflight=%s chunked=%s waiting_head=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                len(self.waiting_queue),
+                len(self.disagg_prefill_bootstrap_queue.queue),
+                len(self.disagg_prefill_inflight_queue),
+                None if self.chunked_req is None else self._pp_prefill_diag_req(self.chunked_req),
+                self._pp_prefill_diag_queue(list(self.waiting_queue)),
+            )
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -2129,6 +2169,7 @@ class Scheduler(
                                 self.tree_cache.check_prefetch_progress(req.rid)
                             )
                         if not prefetch_done:
+                            diag_stop_reason = f"prefetch_timeout:{req.rid}"
                             break
                     else:
                         continue
@@ -2168,6 +2209,17 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if diag_enabled:
+                logger.warning(
+                    "[PPPrefillDiag][candidate] pp=%s cp=%s tp=%s rid=%s result=%s "
+                    "detail=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    req.rid,
+                    res.name,
+                    self._pp_prefill_diag_req(req),
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -2181,11 +2233,25 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                diag_stop_reason = f"adder_stop:{req.rid}:{res.name}"
                 break
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if diag_enabled:
+                logger.warning(
+                    "[PPPrefillDiag][empty] pp=%s cp=%s tp=%s reason=%s waiting=%s "
+                    "bootstrap=%s inflight=%s waiting_head=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    diag_stop_reason,
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                    len(self.disagg_prefill_inflight_queue),
+                    self._pp_prefill_diag_queue(list(self.waiting_queue)),
+                )
             return None
 
         self.waiting_queue = [
@@ -2229,6 +2295,20 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if diag_enabled:
+            logger.warning(
+                "[PPPrefillDiag][selected] pp=%s cp=%s tp=%s reason=%s selected=%s "
+                "remaining_waiting=%s bootstrap=%s inflight=%s remaining_head=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                diag_stop_reason,
+                self._pp_prefill_diag_queue(can_run_list),
+                len(self.waiting_queue),
+                len(self.disagg_prefill_bootstrap_queue.queue),
+                len(self.disagg_prefill_inflight_queue),
+                self._pp_prefill_diag_queue(list(self.waiting_queue)),
+            )
 
         # Record prefill stats for logging after forward
         new_batch.prefill_stats = PrefillStats(

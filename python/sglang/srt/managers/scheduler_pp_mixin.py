@@ -753,6 +753,22 @@ class SchedulerPPMixin:
                 )
             )
             self.waiting_queue.extend(good_reqs)
+            if self._pp_prefill_diag_enabled():
+                logger.warning(
+                    "[PPPrefillDiag][bootstrap_apply] pp=%s cp=%s tp=%s "
+                    "consensus_good=%s consensus_bad=%s popped_good=%s popped_failed=%s "
+                    "waiting=%s bootstrap=%s waiting_head=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    good_consensus_bootstrapped_rids,
+                    bad_consensus_bootstrapped_rids,
+                    [req.rid for req in good_reqs],
+                    [req.rid for req in failed_reqs],
+                    len(self.waiting_queue),
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                    self._pp_prefill_diag_queue(list(self.waiting_queue)),
+                )
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
@@ -783,6 +799,33 @@ class SchedulerPPMixin:
             )
             bad_bootstrapped_rids = _ordered_union(
                 prev_bad_bootstrapped_rids, curr_bad_bootstrapped_rids
+            )
+            if self._pp_prefill_diag_enabled():
+                logger.warning(
+                    "[PPPrefillDiag][bootstrap_intersection] pp=%s cp=%s tp=%s "
+                    "prev_good=%s curr_good=%s merged_good=%s prev_bad=%s curr_bad=%s "
+                    "merged_bad=%s bootstrap=%s",
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    self.attn_tp_rank,
+                    prev_good_bootstrapped_rids,
+                    curr_good_bootstrapped_rids,
+                    good_bootstrapped_rids,
+                    prev_bad_bootstrapped_rids,
+                    curr_bad_bootstrapped_rids,
+                    bad_bootstrapped_rids,
+                    len(self.disagg_prefill_bootstrap_queue.queue),
+                )
+        if self._pp_prefill_diag_enabled() and self.pp_group.is_first_rank:
+            logger.warning(
+                "[PPPrefillDiag][bootstrap_poll] pp=%s cp=%s tp=%s local_good=%s "
+                "local_bad=%s bootstrap=%s",
+                self.pp_rank,
+                self.attn_cp_rank,
+                self.attn_tp_rank,
+                good_bootstrapped_rids,
+                bad_bootstrapped_rids,
+                len(self.disagg_prefill_bootstrap_queue.queue),
             )
         return [good_bootstrapped_rids, bad_bootstrapped_rids]
 
