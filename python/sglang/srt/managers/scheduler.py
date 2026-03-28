@@ -2179,13 +2179,38 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            prefix_len_after_init = len(req.prefix_indices)
+            recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
+            is_pp_prefill = (
+                self.pp_size > 1
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+            )
+            if req.extend_input_len != recomputed_extend_len:
+                if is_pp_prefill:
+                    logger.error(
+                        "[PPShape] req length mismatch before add_one_req; "
+                        "deferring request to next round: "
+                        "rid=%s fill_len=%s prefix_len=%s host_hit=%s storage_hit=%s "
+                        "extend_input_len=%s recomputed_extend_len=%s is_chunked=%s "
+                        "pp=%s cp=%s tp=%s",
+                        req.rid,
+                        len(req.fill_ids),
+                        prefix_len_after_init,
+                        req.host_hit_length,
+                        req.storage_hit_length,
+                        req.extend_input_len,
+                        recomputed_extend_len,
+                        req.is_chunked,
+                        self.pp_rank,
+                        self.attn_cp_rank,
+                        self.attn_tp_rank,
+                    )
+                    diag_stop_reason = f"extend_len_mismatch:{req.rid}"
+                    break
             if (
                 os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
-                and self.pp_size > 1
-                and self.disaggregation_mode == DisaggregationMode.PREFILL
+                and is_pp_prefill
             ):
-                prefix_len_after_init = len(req.prefix_indices)
-                recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
                 if req.extend_input_len != recomputed_extend_len:
                     logger.warning(
                         "[PPShape] req length mismatch before add_one_req: "
