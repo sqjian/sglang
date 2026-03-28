@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -22,6 +23,8 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -205,6 +208,25 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
+        query_numel = query.numel()
+        query_divisor = num_tokens * self.head_size
+        if (
+            query_divisor > 0
+            and query_numel % query_divisor != 0
+        ):
+            logger.error(
+                "[PPShape] rotary query reshape mismatch: num_tokens=%s "
+                "head_size=%s query_shape=%s query_numel=%s divisor=%s "
+                "remainder=%s positions_shape=%s offsets_present=%s",
+                num_tokens,
+                self.head_size,
+                tuple(query_shape),
+                query_numel,
+                query_divisor,
+                query_numel % query_divisor,
+                tuple(positions.shape),
+                offsets is not None,
+            )
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
@@ -214,6 +236,22 @@ class RotaryEmbedding(MultiPlatformOp):
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
+        key_numel = key.numel()
+        key_divisor = num_tokens * self.head_size
+        if (
+            key_divisor > 0
+            and key_numel % key_divisor != 0
+        ):
+            logger.error(
+                "[PPShape] rotary key reshape mismatch: num_tokens=%s "
+                "head_size=%s key_shape=%s key_numel=%s divisor=%s remainder=%s",
+                num_tokens,
+                self.head_size,
+                tuple(key_shape),
+                key_numel,
+                key_divisor,
+                key_numel % key_divisor,
+            )
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]

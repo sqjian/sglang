@@ -321,6 +321,9 @@ class PrefillBootstrapQueue:
                         req.disagg_kv_sender.abort()
                     if hasattr(req.disagg_kv_sender, "clear"):
                         req.disagg_kv_sender.clear()
+                    if self.scheduler.enable_hicache_storage:
+                        # release prefetch events locally even when abort is non-authoritative
+                        self.scheduler.tree_cache.release_aborted_request(req.rid)
                 continue
 
             # KV.WaitingForInput - init here
@@ -587,6 +590,7 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
+        successful_done_reqs: List[Req] = []
 
         polls = []
         if not use_pending_poll:
@@ -634,6 +638,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
                 done_reqs.append(req)
+                successful_done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
@@ -667,13 +672,17 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req.time_stats.set_completion_time()
 
-        # Stream requests which have finished transfer
-        if authoritative_abort or rids_to_check is None:
-            self.stream_output(
-                done_reqs,
-                any(req.return_logprob for req in done_reqs),
-                None,
-            )
+        # Stream requests which have finished transfer.
+        # In PP mode, only failed requests are authority-gated; successful completions
+        # keep the original output path to avoid suppressing normal completion side effects.
+        stream_reqs = done_reqs
+        if rids_to_check is not None and not authoritative_abort:
+            stream_reqs = successful_done_reqs
+        self.stream_output(
+            stream_reqs,
+            any(req.return_logprob for req in stream_reqs),
+            None,
+        )
         for req in done_reqs:
             req: Req
 

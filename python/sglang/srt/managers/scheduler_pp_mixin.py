@@ -1198,16 +1198,24 @@ class SchedulerPPMixin:
                     req.host_hit_length,
                     req.storage_hit_length,
                     req.extend_input_len,
+                    req.is_chunked,
                 )
                 for req in self.cur_batch.reqs
             ]
             total_extend = sum(max(req.extend_input_len, 0) for req in self.cur_batch.reqs)
+            input_ids_shape = (
+                tuple(self.cur_batch.input_ids.shape)
+                if getattr(self.cur_batch, "input_ids", None) is not None
+                else None
+            )
             logger.warning(
                 "[PPShape] launch batch summary: mb_id=%s reqs=%s total_extend=%s "
-                "pp=%s cp=%s tp=%s lens=%s",
+                "extend_num_tokens=%s input_ids_shape=%s pp=%s cp=%s tp=%s lens=%s",
                 mb_id,
                 len(self.cur_batch.reqs),
                 total_extend,
+                getattr(self.cur_batch, "extend_num_tokens", None),
+                input_ids_shape,
                 self.pp_rank,
                 self.attn_cp_rank,
                 self.attn_tp_rank,
