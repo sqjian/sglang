@@ -251,6 +251,8 @@ class PrefillBootstrapQueue:
         self,
         return_failed_reqs: bool = False,
         rids_to_check: Optional[List[str]] = None,
+        use_pending_poll: bool = False,
+        authoritative_failures: bool = True,
     ) -> List[Req]:
         """
         pop the reqs which has finished bootstrapping
@@ -269,13 +271,24 @@ class PrefillBootstrapQueue:
             else:
                 return [], []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.queue],
-            self.scheduler.attn_cp_cpu_group,
-            self.scheduler.attn_tp_cpu_group,
-        )
+        polls = []
+        if not use_pending_poll:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
+        for i, req in enumerate(self.queue):
+            poll = (
+                getattr(req, "_sgl_pp_bootstrap_pending_poll", None)
+                if use_pending_poll
+                else polls[i]
+            )
+            if use_pending_poll and hasattr(req, "_sgl_pp_bootstrap_pending_poll"):
+                delattr(req, "_sgl_pp_bootstrap_pending_poll")
+            if poll is None:
+                continue
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
@@ -284,24 +297,30 @@ class PrefillBootstrapQueue:
             if poll == KVPoll.Bootstrapping:
                 continue
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                if self.scheduler.enable_hicache_storage:
-                    # to release prefetch events associated with the request
-                    self.scheduler.tree_cache.release_aborted_request(req.rid)
+                if authoritative_failures:
+                    error_message = f"Prefill bootstrap failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                    try:
+                        req.disagg_kv_sender.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                    logger.error(error_message)
+                    req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    self.scheduler.stream_output([req], req.return_logprob)
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    if self.scheduler.enable_hicache_storage:
+                        # to release prefetch events associated with the request
+                        self.scheduler.tree_cache.release_aborted_request(req.rid)
+                else:
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
                 continue
 
             # KV.WaitingForInput - init here
@@ -555,7 +574,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
     def process_disagg_prefill_inflight_queue(
-        self: Scheduler, rids_to_check: Optional[List[str]] = None
+        self: Scheduler,
+        rids_to_check: Optional[List[str]] = None,
+        use_pending_poll: bool = False,
+        authoritative_abort: bool = True,
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
@@ -566,15 +588,27 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
-        polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-        )
+        polls = []
+        if not use_pending_poll:
+            polls = poll_and_all_reduce_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for i, req in enumerate(self.disagg_prefill_inflight_queue):
+            poll = (
+                getattr(req, "_sgl_pp_transfer_pending_poll", None)
+                if use_pending_poll
+                else polls[i]
+            )
+            if use_pending_poll and hasattr(req, "_sgl_pp_transfer_pending_poll"):
+                delattr(req, "_sgl_pp_transfer_pending_poll")
+            if poll is None:
+                undone_reqs.append(req)
+                continue
 
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
@@ -603,18 +637,28 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.warning(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                if authoritative_abort:
+                    try:
+                        req.disagg_kv_sender.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                    logger.warning(error_message)
+                    req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                    prepare_abort(
+                        req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                else:
+                    logger.warning(
+                        "Non-authoritative PP rank skipping transfer abort stream for rid=%s",
+                        req.rid,
+                    )
+                    if hasattr(req.disagg_kv_sender, "abort"):
+                        req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
                 done_reqs.append(req)
-                if self.enable_metrics:
+                if authoritative_abort and self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 logger.warning("Unexpected polling state %s for rid=%s", poll, req.rid)
@@ -624,11 +668,12 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_completion_time()
 
         # Stream requests which have finished transfer
-        self.stream_output(
-            done_reqs,
-            any(req.return_logprob for req in done_reqs),
-            None,
-        )
+        if authoritative_abort or rids_to_check is None:
+            self.stream_output(
+                done_reqs,
+                any(req.return_logprob for req in done_reqs),
+                None,
+            )
         for req in done_reqs:
             req: Req
 

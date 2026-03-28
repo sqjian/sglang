@@ -310,7 +310,11 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    self.process_disagg_prefill_inflight_queue(
+                        next_release_rids,
+                        use_pending_poll=True,
+                        authoritative_abort=self.pp_group.is_first_rank,
+                    )
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -750,6 +754,8 @@ class SchedulerPPMixin:
                     return_failed_reqs=True,
                     rids_to_check=good_consensus_bootstrapped_rids
                     + bad_consensus_bootstrapped_rids,
+                    use_pending_poll=True,
+                    authoritative_failures=self.pp_group.is_first_rank,
                 )
             )
             self.waiting_queue.extend(good_reqs)
@@ -781,6 +787,7 @@ class SchedulerPPMixin:
                 True,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
+                pending_poll_attr="_sgl_pp_bootstrap_pending_poll",
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -793,6 +800,7 @@ class SchedulerPPMixin:
                 True,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
+                pending_poll_attr="_sgl_pp_bootstrap_pending_poll",
             )
             good_bootstrapped_rids = _ordered_intersection(
                 prev_good_bootstrapped_rids, curr_good_bootstrapped_rids
@@ -836,6 +844,7 @@ class SchedulerPPMixin:
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
+                pending_poll_attr="_sgl_pp_transfer_pending_poll",
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
@@ -847,6 +856,7 @@ class SchedulerPPMixin:
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
+                pending_poll_attr="_sgl_pp_transfer_pending_poll",
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = _ordered_intersection(
@@ -1225,7 +1235,11 @@ class SchedulerPPMixin:
         return result, event
 
     def get_rids(
-        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
+        self: Scheduler,
+        req_queue: List[Req],
+        is_send: bool,
+        *poll_statuses_group,
+        pending_poll_attr: Optional[str] = None,
     ):
         """
         Used by PP, get the required rids with the given poll statuses.
@@ -1236,6 +1250,9 @@ class SchedulerPPMixin:
             self.attn_tp_cpu_group,
         )
         rids: List = []
+        if pending_poll_attr is not None:
+            for req, poll in zip(req_queue, polls):
+                setattr(req, pending_poll_attr, poll)
         for poll_statuses in poll_statuses_group:
             rids.append(
                 [
