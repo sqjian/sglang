@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -55,6 +57,7 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+logger = logging.getLogger(__name__)
 
 
 class BaseIndexerMetadata(ABC):
@@ -270,6 +273,7 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        debug_pp_shape = os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -308,6 +312,30 @@ class Indexer(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
+        if debug_pp_shape:
+            logger.warning(
+                "[PPShape] nsa qk pre-rotary: positions_shape=%s q_lora_shape=%s "
+                "x_shape=%s query_shape=%s key_shape=%s q_rope_shape=%s "
+                "k_rope_shape=%s extend_num_tokens=%s num_token_non_padded_cpu=%s "
+                "nsa_cp_tokens=%s cp_rank=%s cp_size=%s pp_is_first=%s",
+                tuple(positions.shape),
+                tuple(q_lora.shape),
+                tuple(x.shape) if isinstance(x, torch.Tensor) else tuple(x[0].shape),
+                tuple(query.shape),
+                tuple(key.shape),
+                tuple(q_rope.shape),
+                tuple(k_rope.shape),
+                getattr(forward_batch, "extend_num_tokens", None),
+                getattr(forward_batch, "num_token_non_padded_cpu", None),
+                (
+                    getattr(forward_batch.nsa_cp_metadata, "per_rank_actual_token", None)
+                    if forward_batch.nsa_cp_metadata is not None
+                    else None
+                ),
+                get_attn_context_model_parallel_rank(),
+                self.cp_size,
+                get_pp_group().is_first_rank,
+            )
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
         query[..., : self.rope_head_dim] = q_rope
@@ -333,6 +361,16 @@ class Indexer(MultiPlatformOp):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            if debug_pp_shape:
+                logger.warning(
+                    "[PPShape] nsa qk post-gather: query_shape=%s key_shape=%s "
+                    "positions_shape=%s extend_num_tokens=%s nsa_cp_tokens=%s",
+                    tuple(query.shape),
+                    tuple(key.shape),
+                    tuple(positions.shape),
+                    getattr(forward_batch, "extend_num_tokens", None),
+                    getattr(forward_batch.nsa_cp_metadata, "per_rank_actual_token", None),
+                )
         return query, key
 
     def _get_k_bf16(

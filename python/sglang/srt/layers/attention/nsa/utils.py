@@ -1,4 +1,6 @@
 # temp NSA debugging environ
+import logging
+import os
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Tuple, Union
@@ -25,6 +27,8 @@ from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
@@ -174,12 +178,23 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
+    debug_pp_shape = os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        result = nsa_cp_round_robin_split_data(input_)
+        if debug_pp_shape:
+            logger.warning(
+                "[PPShape] nsa cp split data: mode=round_robin input_shape=%s "
+                "output_shape=%s cp_rank=%s cp_size=%s",
+                tuple(input_.shape),
+                tuple(result.shape),
+                get_attention_cp_rank(),
+                cp_size,
+            )
+        return result
 
     input_list = list(
         torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
@@ -187,17 +202,40 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     result = torch.cat(
         [input_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
+    if debug_pp_shape:
+        metadata = forward_batch.nsa_cp_metadata
+        logger.warning(
+            "[PPShape] nsa cp split data: mode=in_seq input_shape=%s "
+            "output_shape=%s split_list=%s zigzag_index=%s per_rank_actual_token=%s",
+            tuple(input_.shape),
+            tuple(result.shape),
+            metadata.split_list,
+            metadata.zigzag_index,
+            metadata.per_rank_actual_token,
+        )
     return result
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
+    debug_pp_shape = os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
+    original_positions_shape = tuple(positions.shape)
     if is_nsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        result = nsa_cp_round_robin_split_data(positions)
+        if debug_pp_shape:
+            logger.warning(
+                "[PPShape] nsa cp split positions: mode=round_robin positions_shape=%s "
+                "result_shape=%s cp_rank=%s cp_size=%s",
+                tuple(positions.shape),
+                tuple(result.shape),
+                get_attention_cp_rank(),
+                cp_size,
+            )
+        return result
 
     position_id_list = list(
         torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
@@ -206,6 +244,17 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         [position_id_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index],
         dim=-1,
     )
+    if debug_pp_shape:
+        metadata = forward_batch.nsa_cp_metadata
+        logger.warning(
+            "[PPShape] nsa cp split positions: mode=in_seq positions_shape=%s "
+            "result_shape=%s split_list=%s zigzag_index=%s per_rank_actual_token=%s",
+            original_positions_shape,
+            tuple(positions.shape),
+            metadata.split_list,
+            metadata.zigzag_index,
+            metadata.per_rank_actual_token,
+        )
     return positions
 
 
@@ -359,6 +408,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
+    debug_pp_shape = os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
     if is_nsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
@@ -376,6 +426,15 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             .transpose(0, 1)
             .reshape(out_shape)
         )
+        if debug_pp_shape:
+            logger.warning(
+                "[PPShape] nsa cp gather output: mode=round_robin input_shape=%s "
+                "gathered_shape=%s cp_rank=%s cp_size=%s",
+                tuple(input_tensor.shape),
+                tuple(output_tensor.shape),
+                get_attention_cp_rank(),
+                cp_size,
+            )
         return output_tensor
 
     bs_seq_len, hidden_size = input_tensor.shape
@@ -395,6 +454,19 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
+    if debug_pp_shape:
+        metadata = forward_batch.nsa_cp_metadata
+        logger.warning(
+            "[PPShape] nsa cp gather output: mode=in_seq input_shape=%s "
+            "output_shape=%s reverse_split_len=%s cp_reverse_index=%s "
+            "per_rank_actual_token=%s total_seq_lens_shape=%s",
+            tuple(input_tensor.shape),
+            tuple(output_tensor.shape),
+            metadata.reverse_split_len,
+            metadata.cp_reverse_index,
+            metadata.per_rank_actual_token,
+            tuple(metadata.total_seq_lens.shape),
+        )
     return output_tensor
 
 

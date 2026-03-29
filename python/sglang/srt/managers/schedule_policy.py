@@ -768,6 +768,19 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                if os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1":
+                    logger.warning(
+                        "[PPShape] add_one_req before init_load_back: rid=%s "
+                        "fill_len=%s prefix_len=%s host_hit=%s storage_hit=%s "
+                        "extend_input_len=%s cache_protected_len=%s",
+                        req.rid,
+                        len(req.fill_ids),
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        req.storage_hit_length,
+                        req.extend_input_len,
+                        req.cache_protected_len,
+                    )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
@@ -775,6 +788,19 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                if os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1":
+                    logger.warning(
+                        "[PPShape] add_one_req after init_load_back: rid=%s "
+                        "new_indices=%s prefix_len=%s host_hit=%s storage_hit=%s "
+                        "extend_input_len=%s cache_protected_len=%s",
+                        req.rid,
+                        len(new_indices),
+                        len(req.prefix_indices),
+                        req.host_hit_length,
+                        req.storage_hit_length,
+                        req.extend_input_len,
+                        req.cache_protected_len,
+                    )
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

@@ -29,6 +29,8 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 
 class ForwardMode(IntEnum):
@@ -505,6 +508,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
+            if os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1":
+                logger.warning(
+                    "[PPShape] forward batch positions: forward_mode=%s "
+                    "batch_extend_num_tokens=%s positions_shape=%s "
+                    "extend_seq_lens=%s extend_prefix_lens=%s extend_start_loc_shape=%s",
+                    ret.forward_mode.name,
+                    ret.extend_num_tokens,
+                    tuple(ret.positions.shape),
+                    batch.extend_seq_lens,
+                    batch.extend_prefix_lens,
+                    tuple(ret.extend_start_loc.shape),
+                )
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
@@ -1020,6 +1035,20 @@ def compute_position(
     else:
         positions, extend_start_loc = compute_position_torch(
             extend_prefix_lens, extend_seq_lens
+        )
+    computed_sum = int(extend_seq_lens.sum().item())
+    if (
+        os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
+        and computed_sum != extend_seq_lens_sum
+    ):
+        logger.warning(
+            "[PPShape] compute_position sum mismatch: provided_sum=%s "
+            "computed_sum=%s prefix_lens=%s extend_seq_lens=%s positions_shape=%s",
+            extend_seq_lens_sum,
+            computed_sum,
+            extend_prefix_lens.detach().cpu().tolist(),
+            extend_seq_lens.detach().cpu().tolist(),
+            tuple(positions.shape),
         )
     return positions, extend_start_loc
 

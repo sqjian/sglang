@@ -879,6 +879,7 @@ class Req(ReqDllmMixin):
 
         if tree_cache is not None:
             match_result = None
+            match_source = "live_match"
             if use_latched_hicache_result:
                 pop_prefetch_ready_result = getattr(
                     tree_cache, "pop_prefetch_ready_result", None
@@ -888,6 +889,7 @@ class Req(ReqDllmMixin):
                     if ready_result is not None:
                         match_result = ready_result.match_result
                         self.storage_hit_length = ready_result.storage_hit_length
+                        match_source = "latched_ready"
                     else:
                         self.storage_hit_length = 0
             if match_result is None:
@@ -914,16 +916,21 @@ class Req(ReqDllmMixin):
             self.cache_protected_len = len(self.prefix_indices)
             if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
                 logger.warning(
-                    "[HiCacheMatchChain] init_next_round_input: rid=%s fill_len=%s "
-                    "token_ids_len=%s matched_device=%s matched_host=%s prefix_len=%s "
-                    "cache_protected_len=%s",
+                    "[HiCacheMatchChain] init_next_round_input: rid=%s source=%s "
+                    "fill_len=%s token_ids_len=%s matched_device=%s matched_host=%s "
+                    "storage_hit=%s prefix_len=%s cache_protected_len=%s "
+                    "last_device_node=%s last_host_node=%s",
                     self.rid,
+                    match_source,
                     len(self.fill_ids),
                     len(token_ids),
                     len(match_result.device_indices),
                     match_result.host_hit_length,
+                    self.storage_hit_length,
                     len(self.prefix_indices),
                     self.cache_protected_len,
+                    getattr(match_result.last_device_node, "id", None),
+                    getattr(match_result.last_host_node, "id", None),
                 )
 
         if (
@@ -942,6 +949,20 @@ class Req(ReqDllmMixin):
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        if os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1":
+            logger.warning(
+                "[PPShape] init_next_round_input summary: rid=%s fill_len=%s "
+                "prefix_len=%s host_hit=%s storage_hit=%s extend_input_len=%s "
+                "cache_protected_len=%s is_chunked=%s",
+                self.rid,
+                len(self.fill_ids),
+                len(self.prefix_indices),
+                self.host_hit_length,
+                self.storage_hit_length,
+                self.extend_input_len,
+                self.cache_protected_len,
+                self.is_chunked,
+            )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

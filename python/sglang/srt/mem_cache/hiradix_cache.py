@@ -596,6 +596,17 @@ class HiRadixCache(RadixCache):
                 self.prefetch_skipped_rids.discard(req_id)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
+                    if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                        logger.warning(
+                            "[HiCacheMatchChain] revoke cleanup: rid=%s host_node=%s "
+                            "token_count=%s pp=%s cp=%s tp=%s",
+                            req_id,
+                            getattr(last_host_node, "id", None),
+                            len(token_ids),
+                            self.pp_rank,
+                            self.attn_cp_rank,
+                            getattr(self.cache_controller, "tp_rank", None),
+                        )
                     last_host_node.release_host()
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
@@ -1282,9 +1293,25 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         if req is not None:
-            self.prefetch_ready_results_by_reqid[req_id] = (
-                self._build_latched_prefetch_ready_result(req, loaded_from_storage)
+            ready_result = self._build_latched_prefetch_ready_result(
+                req, loaded_from_storage
             )
+            self.prefetch_ready_results_by_reqid[req_id] = ready_result
+            if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+                logger.warning(
+                    "[HiCacheMatchChain] latched ready result: rid=%s "
+                    "prefix_len=%s host_hit=%s storage_hit=%s "
+                    "last_device_node=%s last_host_node=%s pp=%s cp=%s tp=%s",
+                    req_id,
+                    len(ready_result.match_result.device_indices),
+                    ready_result.match_result.host_hit_length,
+                    ready_result.storage_hit_length,
+                    getattr(ready_result.match_result.last_device_node, "id", None),
+                    getattr(ready_result.match_result.last_host_node, "id", None),
+                    self.pp_rank,
+                    self.attn_cp_rank,
+                    getattr(self.cache_controller, "tp_rank", None),
+                )
 
         if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
             logger.warning(
@@ -1329,7 +1356,26 @@ class HiRadixCache(RadixCache):
         self, req_id: str
     ) -> Optional[LatchedPrefetchReadyResult]:
         self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
-        return self.prefetch_ready_results_by_reqid.pop(req_id, None)
+        ready_result = self.prefetch_ready_results_by_reqid.pop(req_id, None)
+        if (
+            ready_result is not None
+            and os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1"
+        ):
+            logger.warning(
+                "[HiCacheMatchChain] consume latched ready result: rid=%s "
+                "prefix_len=%s host_hit=%s storage_hit=%s "
+                "last_device_node=%s last_host_node=%s pp=%s cp=%s tp=%s",
+                req_id,
+                len(ready_result.match_result.device_indices),
+                ready_result.match_result.host_hit_length,
+                ready_result.storage_hit_length,
+                getattr(ready_result.match_result.last_device_node, "id", None),
+                getattr(ready_result.match_result.last_host_node, "id", None),
+                self.pp_rank,
+                self.attn_cp_rank,
+                getattr(self.cache_controller, "tp_rank", None),
+            )
+        return ready_result
 
     def was_prefetch_skipped(self, req_id: str) -> bool:
         """Return True if prefetch was skipped for this request
@@ -1685,6 +1731,18 @@ class HiRadixCache(RadixCache):
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         self._barrier_attn_groups()
+        if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
+            logger.warning(
+                "[HiCacheMatchChain] abort cleanup: rid=%s completed_tokens=%s "
+                "host_node=%s token_count=%s pp=%s cp=%s tp=%s",
+                rid,
+                completed_tokens,
+                getattr(last_host_node, "id", None),
+                len(token_ids),
+                self.pp_rank,
+                self.attn_cp_rank,
+                getattr(self.cache_controller, "tp_rank", None),
+            )
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])

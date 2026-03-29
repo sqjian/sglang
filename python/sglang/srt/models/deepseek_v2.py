@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -1913,9 +1914,42 @@ class DeepseekV2Model(nn.Module):
         )
 
         if nsa_use_prefill_cp(forward_batch):
+            debug_pp_shape = os.getenv("SGLANG_DEBUG_PP_PREFILL_SHAPE", "0") == "1"
+            if debug_pp_shape:
+                logger.warning(
+                    "[PPShape] deepseek cp pre-split: hidden_states_shape=%s "
+                    "positions_shape=%s extend_num_tokens=%s num_token_non_padded_cpu=%s "
+                    "per_rank_actual_token=%s pp_is_first=%s",
+                    tuple(hidden_states.shape),
+                    tuple(positions.shape),
+                    getattr(forward_batch, "extend_num_tokens", None),
+                    getattr(forward_batch, "num_token_non_padded_cpu", None),
+                    (
+                        getattr(forward_batch.nsa_cp_metadata, "per_rank_actual_token", None)
+                        if forward_batch.nsa_cp_metadata is not None
+                        else None
+                    ),
+                    self.pp_group.is_first_rank,
+                )
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            if debug_pp_shape:
+                logger.warning(
+                    "[PPShape] deepseek cp post-split: hidden_states_shape=%s "
+                    "positions_shape=%s token_diff=%s extend_num_tokens=%s "
+                    "per_rank_actual_token=%s pp_is_first=%s",
+                    tuple(hidden_states.shape),
+                    tuple(positions.shape),
+                    hidden_states.shape[0] - positions.shape[0],
+                    getattr(forward_batch, "extend_num_tokens", None),
+                    (
+                        getattr(forward_batch.nsa_cp_metadata, "per_rank_actual_token", None)
+                        if forward_batch.nsa_cp_metadata is not None
+                        else None
+                    ),
+                    self.pp_group.is_first_rank,
+                )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
