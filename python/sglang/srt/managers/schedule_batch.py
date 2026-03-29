@@ -858,7 +858,11 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+    def init_next_round_input(
+        self,
+        tree_cache: Optional[BasePrefixCache] = None,
+        use_latched_hicache_result: bool = False,
+    ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -874,13 +878,26 @@ class Req(ReqDllmMixin):
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self,
-                    cow_mamba=tree_cache.supports_mamba(),
+            match_result = None
+            if use_latched_hicache_result:
+                pop_prefetch_ready_result = getattr(
+                    tree_cache, "pop_prefetch_ready_result", None
                 )
-            )
+                if pop_prefetch_ready_result is not None:
+                    ready_result = pop_prefetch_ready_result(self.rid)
+                    if ready_result is not None:
+                        match_result = ready_result.match_result
+                        self.storage_hit_length = ready_result.storage_hit_length
+                    else:
+                        self.storage_hit_length = 0
+            if match_result is None:
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                        req=self,
+                        cow_mamba=tree_cache.supports_mamba(),
+                    )
+                )
             (
                 self.prefix_indices,
                 self.last_node,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import heapq
 import json
 import logging
@@ -53,10 +54,17 @@ from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class LatchedPrefetchReadyResult:
+    match_result: MatchResult
+    storage_hit_length: int
 
 
 class HiRadixCache(RadixCache):
@@ -233,6 +241,10 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # track finalized prefetch match results for stable scheduler consumption
+        self.prefetch_ready_results_by_reqid: dict[
+            str, LatchedPrefetchReadyResult
+        ] = {}
         # track requests whose prefetch was skipped (alloc failure, threshold, rate limit)
         self.prefetch_skipped_rids: set[str] = set()
         # todo: dynamically adjust the threshold
@@ -525,6 +537,9 @@ class HiRadixCache(RadixCache):
                     pass
 
                 self.ongoing_prefetch.pop(req_id, None)
+                self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+                self.prefetch_ready_results_by_reqid.pop(req_id, None)
+                self.prefetch_skipped_rids.discard(req_id)
         except Exception:
             logger.exception("Force release pending prefetch ops failed.")
 
@@ -576,6 +591,9 @@ class HiRadixCache(RadixCache):
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
+                self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+                self.prefetch_ready_results_by_reqid.pop(req_id, None)
+                self.prefetch_skipped_rids.discard(req_id)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
@@ -689,8 +707,30 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_ready_results_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
+
+    def _build_latched_prefetch_ready_result(
+        self, req: Req, storage_hit_length: int
+    ) -> LatchedPrefetchReadyResult:
+        input_len = len(req.fill_ids)
+        max_prefix_len = input_len - 1
+        if req.return_logprob and req.logprob_start_len >= 0:
+            max_prefix_len = min(max_prefix_len, req.logprob_start_len)
+        max_prefix_len = max(max_prefix_len, 0)
+        token_ids = req.fill_ids[:max_prefix_len]
+        match_result = self.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+                req=req,
+                cow_mamba=self.supports_mamba(),
+            )
+        )
+        return LatchedPrefetchReadyResult(
+            match_result=match_result,
+            storage_hit_length=storage_hit_length,
+        )
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -1183,7 +1223,9 @@ class HiRadixCache(RadixCache):
         can_terminate = can_terminate or operation_terminated
         return can_terminate
 
-    def check_prefetch_progress(self, req_id: str) -> bool:
+    def check_prefetch_progress(self, req_or_id: Req | str) -> bool:
+        req = req_or_id if not isinstance(req_or_id, str) else None
+        req_id = req.rid if req is not None else req_or_id
         if req_id not in self.ongoing_prefetch:
             # there is no ongoing prefetch for this request or it has been revoked
             return True
@@ -1239,6 +1281,10 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if req is not None:
+            self.prefetch_ready_results_by_reqid[req_id] = (
+                self._build_latched_prefetch_ready_result(req, loaded_from_storage)
+            )
 
         if os.getenv("SGLANG_DEBUG_HICACHE_MATCH_CHAIN", "0") == "1":
             logger.warning(
@@ -1278,6 +1324,12 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_ready_result(
+        self, req_id: str
+    ) -> Optional[LatchedPrefetchReadyResult]:
+        self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+        return self.prefetch_ready_results_by_reqid.pop(req_id, None)
 
     def was_prefetch_skipped(self, req_id: str) -> bool:
         """Return True if prefetch was skipped for this request
@@ -1621,6 +1673,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_ready_results_by_reqid.pop(rid, None)
         self.prefetch_skipped_rids.discard(rid)
 
         if rid not in self.ongoing_prefetch:

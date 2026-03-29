@@ -2145,7 +2145,15 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                use_latched_hicache_result = hasattr(
+                    self.tree_cache, "pop_prefetch_ready_result"
+                )
+                prefetch_progress_arg = (
+                    req if use_latched_hicache_result else req.rid
+                )
+                prefetch_done = self.tree_cache.check_prefetch_progress(
+                    prefetch_progress_arg
+                )
                 if not prefetch_done:
                     if self.pp_size > 1:
                         timeout_s = max(
@@ -2166,19 +2174,27 @@ class Scheduler(
                             self.tree_cache.check_hicache_events()
                             time.sleep(0.001)
                             prefetch_done = (
-                                self.tree_cache.check_prefetch_progress(req.rid)
+                                self.tree_cache.check_prefetch_progress(
+                                    prefetch_progress_arg
+                                )
                             )
                         if not prefetch_done:
                             diag_stop_reason = f"prefetch_timeout:{req.rid}"
                             break
                     else:
                         continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                if not use_latched_hicache_result:
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                        req.rid
+                    )
+            else:
+                use_latched_hicache_result = False
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache,
+                use_latched_hicache_result=use_latched_hicache_result,
+            )
             prefix_len_after_init = len(req.prefix_indices)
             recomputed_extend_len = len(req.fill_ids) - prefix_len_after_init
             is_pp_prefill = (
