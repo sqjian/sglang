@@ -509,6 +509,13 @@ class HiMambaRadixCache(MambaRadixCache):
     def ready_to_load_host_cache(self) -> int:
         return self.cache_controller.start_loading()
 
+    def is_load_ready(self, consumer_index: int) -> bool:
+        if consumer_index < 0:
+            return True
+        return self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event.query()
+
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()

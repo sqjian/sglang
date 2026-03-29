@@ -208,6 +208,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def is_load_ready(self, consumer_index: Any) -> bool:
+        """
+        Return whether the given hicache load batch has completed.
+        Prefix-cache implementations without asynchronous host->device loading
+        can treat every batch as ready.
+        """
+        return True
+
     def take_events(self):
         return []
 

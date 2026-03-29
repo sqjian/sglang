@@ -2334,6 +2334,23 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            if self.pp_size > 1 and new_batch.hicache_consumer_index >= 0:
+                timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
+                wait_start = time.perf_counter()
+                while True:
+                    # Drain finished hicache events before checking whether the
+                    # selected batch can be launched on the updated cache view.
+                    self.tree_cache.check_hicache_events()
+                    if self.tree_cache.is_load_ready(new_batch.hicache_consumer_index):
+                        break
+                    if time.perf_counter() - wait_start >= timeout_s:
+                        raise RuntimeError(
+                            "[PPHicacheLoad] launch gate timeout before batch launch: "
+                            f"consumer_index={new_batch.hicache_consumer_index} "
+                            f"reqs={new_batch.batch_size()} pp={self.pp_rank} "
+                            f"cp={self.attn_cp_rank} tp={self.attn_tp_rank}"
+                        )
+                    time.sleep(0.001)
 
         new_batch.prepare_for_extend()
         if diag_enabled:
