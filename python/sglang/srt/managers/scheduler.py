@@ -2338,9 +2338,9 @@ class Scheduler(
                 timeout_s = max(envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get(), 1)
                 wait_start = time.perf_counter()
                 while True:
-                    # Drain finished hicache events before checking whether the
-                    # selected batch can be launched on the updated cache view.
-                    self.tree_cache.check_hicache_events()
+                    # Only poll the local load completion event here. Running
+                    # hicache event draining can enter attn-group collectives
+                    # and deadlock if PP ranks diverge during launch gating.
                     if self.tree_cache.is_load_ready(new_batch.hicache_consumer_index):
                         break
                     if time.perf_counter() - wait_start >= timeout_s:
