@@ -188,6 +188,10 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hicache_protocol import (
+    HiCacheDecision,
+    HiCacheFinalState,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -793,6 +797,9 @@ class Scheduler(
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
+                # Verify HiCache configuration consistency across PP ranks
+                self._verify_hicache_pp_config_consistency(server_args)
+
                 if self.is_hybrid_ssm:
                     from sglang.srt.mem_cache.hi_mamba_radix_cache import (
                         HiMambaRadixCache,
@@ -836,6 +843,10 @@ class Scheduler(
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
+        # Dict for storing HiCache decisions before forwarding to next PP rank
+        # Key: request_id, Value: HiCacheDecision
+        self.pending_hicache_decisions: Dict[str, HiCacheDecision] = {}
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -857,6 +868,63 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _verify_hicache_pp_config_consistency(self, server_args):
+        """Verify HiCache configuration consistency across PP ranks.
+
+        In PP mode (pp_size > 1), all ranks must use identical HiCache
+        configuration to ensure the consistency protocol works correctly.
+        This check is skipped when PP=1.
+
+        Raises:
+            RuntimeError: If HiCache configurations are inconsistent across PP ranks.
+        """
+        # Skip check for PP=1
+        if self.pp_size == 1:
+            return
+
+        # Collect HiCache configuration parameters to check
+        local_config = {
+            "enable_hierarchical_cache": server_args.enable_hierarchical_cache,
+            "hicache_ratio": server_args.hicache_ratio,
+            "hicache_size": server_args.hicache_size,
+            "hicache_write_policy": server_args.hicache_write_policy,
+            "hicache_io_backend": server_args.hicache_io_backend,
+            "hicache_mem_layout": server_args.hicache_mem_layout,
+            "hicache_storage_backend": server_args.hicache_storage_backend,
+            "hicache_storage_prefetch_policy": server_args.hicache_storage_prefetch_policy,
+            "page_size": server_args.page_size,
+        }
+
+        # Gather configurations from all PP ranks
+        all_configs = self.pp_group.all_gather_object(local_config)
+
+        # Compare all configurations against rank 0's configuration
+        rank0_config = all_configs[0]
+        mismatches = []
+
+        for pp_rank, config in enumerate(all_configs):
+            if pp_rank == 0:
+                continue
+            for key, value in config.items():
+                if value != rank0_config[key]:
+                    mismatches.append(
+                        f"  PP rank {pp_rank}: {key}={value} (rank 0: {rank0_config[key]})"
+                    )
+
+        if mismatches:
+            mismatch_details = "\n".join(mismatches)
+            raise RuntimeError(
+                f"HiCache configuration mismatch detected across PP ranks.\n"
+                f"All PP ranks must have identical HiCache configuration for "
+                f"the consistency protocol to work correctly.\n"
+                f"Mismatches:\n{mismatch_details}"
+            )
+
+        if self.tp_rank == 0:
+            logger.info(
+                f"HiCache PP configuration consistency check passed (pp_size={self.pp_size})"
+            )
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1483,13 +1551,20 @@ class Scheduler(
         else:
             if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
-                recv_reqs = point_to_point_pyobj(
+                recv_data = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
                     self.world_group.cpu_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
+                # Handle HiCache protocol: unpack (recv_reqs, decisions) tuple if present
+                if isinstance(recv_data, tuple) and len(recv_data) == 2:
+                    recv_reqs, hicache_decisions = recv_data
+                    if hicache_decisions and hasattr(self, '_store_received_hicache_decisions'):
+                        self._store_received_hicache_decisions(hicache_decisions)
+                else:
+                    recv_reqs = recv_data
             else:
                 recv_reqs = None
 
@@ -1938,7 +2013,15 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefetch_kvcache(self, req: Req, decision: HiCacheDecision = None):
+        """Prefetch KV cache from storage with PP consistency protocol support.
+
+        Args:
+            req: The request to prefetch for.
+            decision: Optional HiCacheDecision received from previous PP rank.
+                      If provided (rank > 0), this decision will be executed.
+                      If None (rank 0), a new decision will be generated.
+        """
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
@@ -1952,13 +2035,82 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
+
+                # Check if PP consistency protocol is enabled
+                protocol_enabled = (
+                    hasattr(self.tree_cache, 'protocol_manager')
+                    and self.tree_cache.protocol_manager.is_enabled
                 )
+
+                if protocol_enabled:
+                    if self.pp_rank == 0:
+                        # Rank 0: Generate decision and execute it
+                        generated_decision = self.tree_cache.generate_prefetch_decision(
+                            req_id=req.rid,
+                            last_host_node=last_host_node,
+                            new_input_tokens=new_input_tokens,
+                            prefix_length=matched_len,
+                            last_hash=last_hash,
+                        )
+                        if generated_decision is not None:
+                            # Store decision for forwarding to next PP rank
+                            self.pending_hicache_decisions[req.rid] = generated_decision
+                            # Execute the decision locally
+                            self.tree_cache.execute_prefetch_decision(
+                                req_id=req.rid,
+                                last_host_node=last_host_node,
+                                decision=generated_decision,
+                                prefix_keys=prefix_keys,
+                            )
+                    else:
+                        # Rank > 0: Look up and execute received decision
+                        received_decision = (
+                            decision if decision is not None
+                            else self._get_hicache_decision_for_request(req.rid)
+                        )
+                        if received_decision is not None:
+                            local_prefix_length = matched_len
+                            outcome = self.tree_cache.execute_given_decision(
+                                req_id=req.rid,
+                                decision=received_decision,
+                                local_prefix_length=local_prefix_length,
+                                last_host_node=last_host_node,
+                                prefix_keys=prefix_keys,
+                            )
+                            # Check if execution failed (e.g., prefix_length mismatch)
+                            if outcome is not None and outcome.final_state == HiCacheFinalState.FAILED:
+                                logger.error(
+                                    f"HiCache execution failed for {req.rid}: "
+                                    f"reason={outcome.failure_reason}, "
+                                    f"local_prefix={outcome.local_prefix_length}, "
+                                    f"decision_prefix={received_decision.prefix_length}"
+                                )
+                                req.to_finish = FINISH_ABORT(
+                                    f"HiCache PP consistency failure: {outcome.failure_reason}"
+                                )
+                        else:
+                            # No decision received, fall back to local prefetch
+                            # This shouldn't happen in normal operation
+                            logger.warning(
+                                f"No HiCache decision received for request {req.rid} on rank {self.pp_rank}, "
+                                "falling back to local prefetch"
+                            )
+                            self.tree_cache.prefetch_from_storage(
+                                req.rid,
+                                last_host_node,
+                                new_input_tokens,
+                                last_hash,
+                                prefix_keys,
+                            )
+                else:
+                    # Protocol not enabled, use original prefetch path
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid,
+                        last_host_node,
+                        new_input_tokens,
+                        last_hash,
+                        prefix_keys,
+                    )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -1967,10 +2119,26 @@ class Scheduler(
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
+            # Check if HiCache PP protocol failed (e.g., prefix_length mismatch)
+            if req.to_finish is not None:
+                logger.warning(
+                    f"Request {req.rid} marked as failed after _prefetch_kvcache: {req.to_finish}"
+                )
+                req.check_finished()
+                self.stream_output([req], req.return_logprob)
+                return
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
+            # Check if HiCache PP protocol failed
+            if req.to_finish is not None:
+                logger.warning(
+                    f"Request {req.rid} marked as failed after _prefetch_kvcache: {req.to_finish}"
+                )
+                req.check_finished()
+                self.stream_output([req], req.return_logprob)
+                return
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
@@ -2463,16 +2631,41 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+                # In PP mode with HiCache protocol enabled, skip prefetch progress check
+                # and radix tree update on ALL ranks to ensure consistent batch composition.
+                # Without proper outcome alignment (TODO), prefetch results cannot be
+                # reliably used across PP ranks, so we skip the entire prefetch tracking.
+                hicache_pp_skip = (
+                    hasattr(self.tree_cache, 'protocol_manager')
+                    and self.tree_cache.protocol_manager.is_enabled
+                    and self.pp_size > 1
                 )
+                if not hicache_pp_skip:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                        req.rid
+                    )
 
-            req.init_next_round_input(self.tree_cache)
+            # In PP mode with HiCache protocol enabled, ALL ranks must skip radix tree
+            # matching to ensure consistent batch composition. The radix tree state
+            # can diverge between PP ranks due to independent prefetch operations.
+            # Without outcome alignment (TODO), we disable prefix caching entirely
+            # in PP + HiCache mode to guarantee tensor shape consistency.
+            hicache_pp_enabled = (
+                self.enable_hicache_storage
+                and hasattr(self.tree_cache, 'protocol_manager')
+                and self.tree_cache.protocol_manager.is_enabled
+                and self.pp_size > 1
+            )
+            if hicache_pp_enabled:
+                # Skip radix tree matching on ALL PP ranks to ensure consistency
+                req.init_next_round_input(tree_cache=None)
+            else:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

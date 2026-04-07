@@ -33,6 +33,13 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 
 logger = logging.getLogger(__name__)
 
+# HiCache protocol message types for PP communication
+HICACHE_MSG_TYPE_DECISION = "hicache_decision"
+HICACHE_MSG_TYPE_OUTCOME = "hicache_outcome"
+HICACHE_MSG_TYPE_BATCHED_OUTCOMES = "hicache_batched_outcomes"
+HICACHE_MSG_TYPE_GLOBAL_FAILED = "hicache_global_failed"
+HICACHE_MSG_TYPE_RELEASE = "hicache_release"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -43,8 +50,55 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _extract_hicache_decisions_for_requests(self: "Scheduler", recv_reqs) -> dict:
+        """Extract pending HiCache decisions for requests being forwarded.
+
+        On rank 0, after process_input_requests generates decisions, this method
+        extracts them to be sent alongside requests to the next PP rank.
+
+        Returns:
+            Dict mapping request_id to HiCacheDecision.
+        """
+        if not hasattr(self, 'pending_hicache_decisions'):
+            return {}
+
+        decisions = {}
+        for req in recv_reqs:
+            rid = getattr(req, 'rid', None)
+            if rid and rid in self.pending_hicache_decisions:
+                decisions[rid] = self.pending_hicache_decisions.pop(rid)
+        return decisions
+
+    def _store_received_hicache_decisions(self: "Scheduler", decisions: dict):
+        """Store HiCache decisions received from the previous PP rank.
+
+        On rank > 0, this stores decisions so they can be looked up during
+        _prefetch_kvcache.
+
+        Args:
+            decisions: Dict mapping request_id to HiCacheDecision.
+        """
+        if not hasattr(self, 'pending_hicache_decisions'):
+            self.pending_hicache_decisions = {}
+
+        if decisions:
+            self.pending_hicache_decisions.update(decisions)
+
+    def _get_hicache_decision_for_request(self: "Scheduler", rid: str):
+        """Get stored HiCache decision for a request (rank > 0 only).
+
+        Args:
+            rid: Request ID to look up.
+
+        Returns:
+            HiCacheDecision if found, None otherwise.
+        """
+        if not hasattr(self, 'pending_hicache_decisions'):
+            return None
+        return self.pending_hicache_decisions.pop(rid, None)
+
     @DynamicGradMode()
-    def event_loop_pp(self: Scheduler):
+    def event_loop_pp(self: "Scheduler"):
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -82,8 +136,14 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
+                        # Pack HiCache decisions with requests for PP consistency protocol
+                        hicache_decisions = self._extract_hicache_decisions_for_requests(recv_reqs)
+                        if hicache_decisions:
+                            send_data = (recv_reqs, hicache_decisions)
+                        else:
+                            send_data = recv_reqs
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
+                            send_data,
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
@@ -293,8 +353,14 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
+                    # Pack HiCache decisions with requests for PP consistency protocol
+                    hicache_decisions = self._extract_hicache_decisions_for_requests(recv_reqs)
+                    if hicache_decisions:
+                        send_data = (recv_reqs, hicache_decisions)
+                    else:
+                        send_data = recv_reqs
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        send_data, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
@@ -471,8 +537,14 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
+                    # Pack HiCache decisions with requests for PP consistency protocol
+                    hicache_decisions = self._extract_hicache_decisions_for_requests(recv_reqs)
+                    if hicache_decisions:
+                        send_data = (recv_reqs, hicache_decisions)
+                    else:
+                        send_data = recv_reqs
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        send_data, async_send=True
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
@@ -917,6 +989,82 @@ class SchedulerPPMixin:
 
         return data
 
+    def _pp_send_pyobj_to_prev_stage(self: Scheduler, data, async_send: bool = False):
+        """
+        Send Python object to the previous PP stage (backward communication).
+
+        Used for sending HiCacheOutcome back to rank 0 for failure handling
+        and outcome aggregation.
+
+        Args:
+            data: The Python object to send.
+            async_send: Whether to send asynchronously.
+
+        Returns:
+            List of P2PWork objects if async, empty list otherwise.
+        """
+        p2p_work = []
+        if self.pp_group.is_first_rank:
+            # rank 0 has no previous rank
+            return p2p_work
+
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            # Send to previous rank (pp_rank - 1)
+            p2p_work = point_to_point_pyobj(
+                data,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                async_send=async_send,
+            )
+        return p2p_work
+
+    def _pp_recv_pyobj_from_next_stage(self: Scheduler):
+        """
+        Receive Python object from the next PP stage (backward communication).
+
+        Used for receiving HiCacheOutcome from subsequent ranks.
+
+        Returns:
+            The received Python object, or None if this is the last rank.
+        """
+        if self.pp_group.is_last_rank:
+            # last rank has no next rank
+            return None
+
+        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            # Receive from next rank (pp_rank + 1)
+            data = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        if self.attn_tp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+
+        if self.attn_cp_size > 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_cp_group.rank,
+                self.attn_cp_cpu_group,
+                src=self.attn_cp_group.ranks[0],
+            )
+
+        return data
+
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
@@ -1278,6 +1426,312 @@ class SchedulerPPMixin:
             self.waiting_queue.extend(released_reqs)
             return [req.rid for req in released_reqs]
         return None
+
+    # =========================================================================
+    # HiCache PP Consistency Protocol Methods
+    # =========================================================================
+
+    def _pp_send_hicache_outcome_to_prev_stage(
+        self: Scheduler, outcome, async_send: bool = True
+    ):
+        """
+        Send HiCache outcome to the previous PP stage (backward communication).
+
+        Args:
+            outcome: The HiCacheOutcome to send.
+            async_send: Whether to send asynchronously.
+
+        Returns:
+            List of P2PWork objects if async, empty list otherwise.
+        """
+        data = {
+            "__hicache_msg_type__": HICACHE_MSG_TYPE_OUTCOME,
+            "outcome": outcome,
+        }
+        return self._pp_send_pyobj_to_prev_stage(data, async_send=async_send)
+
+    def _pp_recv_hicache_outcome_from_next_stage(self: Scheduler):
+        """
+        Receive HiCache outcome from the next PP stage (backward communication).
+
+        Returns:
+            The received HiCacheOutcome, or None if this is the last rank
+            or no outcome was received.
+        """
+        data = self._pp_recv_pyobj_from_next_stage()
+        if data is None:
+            return None
+        if isinstance(data, dict) and data.get("__hicache_msg_type__") == HICACHE_MSG_TYPE_OUTCOME:
+            return data.get("outcome")
+        return None
+
+    def _pp_send_hicache_batched_outcomes_to_prev_stage(
+        self: Scheduler, batched_outcomes, async_send: bool = True
+    ):
+        """
+        Send batched HiCache outcomes to the previous PP stage (backward communication).
+
+        For non-failed outcomes (completed/revoked/skipped), outcomes can be batched
+        together for more efficient transmission. Failed outcomes should still be
+        sent individually using _pp_send_hicache_outcome_to_prev_stage for immediate
+        propagation.
+
+        Args:
+            batched_outcomes: BatchedHiCacheOutcomes containing multiple outcomes.
+            async_send: Whether to send asynchronously.
+
+        Returns:
+            List of P2PWork objects if async, empty list otherwise.
+        """
+        if len(batched_outcomes) == 0:
+            return []
+
+        data = {
+            "__hicache_msg_type__": HICACHE_MSG_TYPE_BATCHED_OUTCOMES,
+            "batched_outcomes": batched_outcomes,
+        }
+        return self._pp_send_pyobj_to_prev_stage(data, async_send=async_send)
+
+    def _pp_recv_hicache_outcomes_from_next_stage(self: Scheduler):
+        """
+        Receive HiCache outcomes from the next PP stage (backward communication).
+
+        This method handles both single outcome and batched outcomes messages.
+
+        Returns:
+            List[HiCacheOutcome]: List of received outcomes (may be empty).
+            Returns single outcome wrapped in a list, or all outcomes from a batch.
+        """
+        data = self._pp_recv_pyobj_from_next_stage()
+        if data is None:
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        msg_type = data.get("__hicache_msg_type__")
+
+        if msg_type == HICACHE_MSG_TYPE_OUTCOME:
+            # Single outcome
+            outcome = data.get("outcome")
+            return [outcome] if outcome else []
+
+        elif msg_type == HICACHE_MSG_TYPE_BATCHED_OUTCOMES:
+            # Batched outcomes
+            batched = data.get("batched_outcomes")
+            if batched is not None:
+                return list(batched.outcomes)
+            return []
+
+        return []
+
+    def _pp_send_hicache_global_failed_notice(
+        self: Scheduler, notice, async_send: bool = False
+    ):
+        """
+        Broadcast GlobalFailedNotice to all subsequent PP ranks (forward).
+
+        This is called by rank 0 when it receives a failed outcome from any rank.
+        The notice is propagated down the PP chain.
+
+        Args:
+            notice: The GlobalFailedNotice to broadcast.
+            async_send: Whether to send asynchronously.
+
+        Returns:
+            List of P2PWork objects if async, empty list otherwise.
+        """
+        data = {
+            "__hicache_msg_type__": HICACHE_MSG_TYPE_GLOBAL_FAILED,
+            "notice": notice,
+        }
+        return self._pp_send_pyobj_to_next_stage(data, async_send=async_send)
+
+    def _pp_send_hicache_release_notice(
+        self: Scheduler, notice, async_send: bool = True
+    ):
+        """
+        Broadcast ReleaseNotice to all subsequent PP ranks (forward).
+
+        Args:
+            notice: The ReleaseNotice to broadcast.
+            async_send: Whether to send asynchronously.
+
+        Returns:
+            List of P2PWork objects if async, empty list otherwise.
+        """
+        data = {
+            "__hicache_msg_type__": HICACHE_MSG_TYPE_RELEASE,
+            "notice": notice,
+        }
+        return self._pp_send_pyobj_to_next_stage(data, async_send=async_send)
+
+    def _pp_check_hicache_forward_barrier(
+        self: Scheduler,
+        batch_reqs: List[Req],
+        protocol_manager,
+    ) -> List[Req]:
+        """
+        Check forward barrier for HiCache requests.
+
+        Filters out requests that are not ready for forward (outcome not aligned).
+
+        Args:
+            batch_reqs: List of requests in the batch.
+            protocol_manager: The HiCacheProtocolManager instance.
+
+        Returns:
+            List of requests that are ready for forward.
+        """
+        if not protocol_manager.is_enabled:
+            return batch_reqs
+
+        ready_reqs = []
+        for req in batch_reqs:
+            req_state = protocol_manager.get_request_state(req.rid)
+            if req_state is None:
+                # No HiCache decision for this request, allow forward
+                ready_reqs.append(req)
+                continue
+
+            if req_state.terminal_state != "none":
+                # Request in terminal state, skip
+                continue
+
+            # Check if outcome is aligned
+            seq_id = req_state.latest_decision_seq_id
+            if seq_id < 0:
+                # No decision yet, allow forward
+                ready_reqs.append(req)
+                continue
+
+            if protocol_manager.is_ready_for_forward(req.rid, seq_id):
+                ready_reqs.append(req)
+            else:
+                logger.debug(
+                    f"Request {req.rid} not ready for forward, "
+                    f"waiting for outcome alignment"
+                )
+
+        return ready_reqs
+
+    # =========================================================================
+    # HiCache TP + PP Mixed Mode Support
+    # =========================================================================
+
+    def _tp_broadcast_hicache_decisions(
+        self: Scheduler, decisions: dict
+    ) -> dict:
+        """
+        Broadcast HiCache decisions within TP group.
+
+        In TP + PP mixed mode, TP rank 0 is responsible for PP communication.
+        This method broadcasts decisions from TP rank 0 to other TP workers.
+
+        Args:
+            decisions: Dict of request_id -> HiCacheDecision (from TP rank 0).
+
+        Returns:
+            Dict of decisions for all TP workers.
+        """
+        if self.attn_tp_size <= 1:
+            return decisions
+
+        # TP rank 0 broadcasts to other TP workers
+        data = broadcast_pyobj(
+            decisions,
+            self.attn_tp_group.rank,
+            self.attn_tp_cpu_group,
+            src=self.attn_tp_group.ranks[0],
+        )
+        return data
+
+    def _tp_verify_hicache_outcome_consistency(
+        self: Scheduler, outcome, protocol_manager
+    ):
+        """
+        Verify HiCache outcome consistency within TP group.
+
+        Each TP worker should produce the same outcome. This method:
+        1. Gathers outcomes from all TP workers
+        2. Verifies they are identical
+        3. Returns (is_consistent, aggregated_outcome)
+
+        Only TP rank 0 participates in PP communication after verification.
+
+        Args:
+            outcome: The local HiCacheOutcome.
+            protocol_manager: The HiCacheProtocolManager instance.
+
+        Returns:
+            Tuple of (is_consistent, outcome_or_failed_outcome).
+        """
+        if self.attn_tp_size <= 1:
+            return True, outcome
+
+        if outcome is None:
+            return True, None
+
+        # Prepare outcome summary for comparison
+        # We compare key fields: final_state, completed_tokens, applied_tokens
+        local_summary = {
+            "request_id": outcome.request_id,
+            "seq_id": outcome.seq_id,
+            "final_state": outcome.final_state.value,
+            "completed_tokens": outcome.completed_tokens,
+            "applied_tokens": outcome.applied_tokens,
+        }
+
+        # Gather summaries from all TP workers using all_gather_object
+        all_summaries = self.attn_tp_group.all_gather_object(local_summary)
+
+        # Verify consistency
+        ref_summary = all_summaries[0]
+        is_consistent = True
+        for i, summary in enumerate(all_summaries[1:], start=1):
+            if (
+                summary["final_state"] != ref_summary["final_state"]
+                or summary["completed_tokens"] != ref_summary["completed_tokens"]
+                or summary["applied_tokens"] != ref_summary["applied_tokens"]
+            ):
+                logger.warning(
+                    f"TP outcome inconsistency for {outcome.request_id}:{outcome.seq_id}: "
+                    f"TP rank 0: {ref_summary}, TP rank {i}: {summary}"
+                )
+                is_consistent = False
+                break
+
+        if not is_consistent:
+            # Create a failed outcome due to TP inconsistency
+            from sglang.srt.mem_cache.hicache_protocol import (
+                HiCacheFinalState,
+                HiCacheFailureReason,
+            )
+
+            failed_outcome = protocol_manager.create_outcome(
+                request_id=outcome.request_id,
+                seq_id=outcome.seq_id,
+                final_state=HiCacheFinalState.FAILED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=outcome.local_prefix_length,
+                failure_reason=HiCacheFailureReason.PROTOCOL_ERROR,
+            )
+            return False, failed_outcome
+
+        # Return original outcome (TP rank 0 will handle PP communication)
+        return True, outcome
+
+    def _is_tp_pp_leader(self: Scheduler) -> bool:
+        """
+        Check if this is the TP/PP communication leader.
+
+        The leader (TP rank 0, CP rank 0) is responsible for PP communication.
+
+        Returns:
+            True if this rank should handle PP communication.
+        """
+        return self.attn_tp_rank == 0 and self.attn_cp_rank == 0
 
 
 class ChunkSizePredictor:

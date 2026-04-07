@@ -25,6 +25,17 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_protocol import (
+    HiCacheAction,
+    HiCacheDecision,
+    HiCacheFinalState,
+    HiCacheFailureReason,
+    HiCacheOutcome,
+)
+from sglang.srt.mem_cache.hicache_protocol_manager import (
+    HiCacheProtocolConfig,
+    HiCacheProtocolManager,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -154,6 +165,16 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+
+        # Initialize HiCache PP consistency protocol manager
+        self.protocol_manager = HiCacheProtocolManager(
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            config=HiCacheProtocolConfig(
+                # Protocol is only enabled for PP > 1 with storage enabled
+                enabled=(self.pp_size > 1 and self.enable_storage),
+            ),
+        )
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -1229,6 +1250,550 @@ class HiRadixCache(RadixCache):
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
 
+    # =========================================================================
+    # HiCache PP Consistency Protocol Methods
+    # =========================================================================
+
+    def generate_prefetch_decision(
+        self,
+        req_id: str,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        prefix_length: int,
+        last_hash: Optional[str] = None,
+    ) -> Optional[HiCacheDecision]:
+        """
+        Generate HiCacheDecision for a prefetch operation (rank 0 only).
+
+        This method determines whether to prefetch, skip, or revoke, and creates
+        the corresponding decision object that will be propagated to subsequent ranks.
+
+        Args:
+            req_id: Request identifier.
+            last_host_node: The last matched host node from match_prefix.
+            new_input_tokens: Tokens to potentially prefetch.
+            prefix_length: Result of match_prefix (for subsequent rank verification).
+            last_hash: Hash of the prefix end node.
+
+        Returns:
+            HiCacheDecision if protocol is enabled, None otherwise.
+        """
+        if not self.protocol_manager.is_enabled:
+            return None
+
+        if not self.protocol_manager.is_rank0:
+            logger.warning(
+                f"generate_prefetch_decision called on rank {self.pp_rank}, "
+                "but this should only be called on rank 0"
+            )
+            return None
+
+        new_input_tokens = (
+            convert_to_bigram_key(new_input_tokens)
+            if self.is_eagle
+            else new_input_tokens
+        )
+
+        # Align to page size
+        prefetch_length = len(new_input_tokens) - (
+            len(new_input_tokens) % self.page_size
+        )
+        aligned_tokens = new_input_tokens[:prefetch_length]
+
+        # Determine action based on conditions
+        if (
+            not self.enable_storage
+            or prefetch_length < self.prefetch_threshold
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            # Generate SKIP decision
+            decision = self.protocol_manager.create_decision(
+                request_id=req_id,
+                action=HiCacheAction.SKIP,
+                planned_tokens=0,
+                token_ids=[],
+                prefix_length=prefix_length,
+                last_hash=last_hash,
+            )
+            logger.debug(
+                f"Generated SKIP decision for {req_id}: "
+                f"storage={self.enable_storage}, prefetch_length={prefetch_length}, "
+                f"threshold={self.prefetch_threshold}"
+            )
+            return decision
+
+        # Generate PREFETCH decision
+        decision = self.protocol_manager.create_decision(
+            request_id=req_id,
+            action=HiCacheAction.PREFETCH,
+            planned_tokens=prefetch_length,
+            token_ids=list(aligned_tokens),
+            prefix_length=prefix_length,
+            last_hash=last_hash,
+        )
+        logger.debug(
+            f"Generated PREFETCH decision for {req_id}: "
+            f"planned_tokens={prefetch_length}, prefix_length={prefix_length}"
+        )
+        return decision
+
+    def execute_prefetch_decision(
+        self,
+        req_id: str,
+        last_host_node: TreeNode,
+        decision: HiCacheDecision,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> Optional[HiCacheOutcome]:
+        """
+        Execute a prefetch decision (can be called on any rank).
+
+        For rank 0, this is called after generate_prefetch_decision.
+        For rank > 0, this is called after receiving and verifying the decision.
+
+        Args:
+            req_id: Request identifier.
+            last_host_node: The last matched host node.
+            decision: The HiCacheDecision to execute.
+            prefix_keys: Prefix keys for storage backend.
+
+        Returns:
+            HiCacheOutcome if execution completed immediately (skip/revoke),
+            None if prefetch is in progress (will produce outcome later).
+        """
+        if decision.action == HiCacheAction.SKIP:
+            # SKIP: No prefetch needed, immediately produce outcome
+            outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=decision.seq_id,
+                final_state=HiCacheFinalState.SKIPPED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=decision.prefix_length,
+            )
+            return outcome
+
+        if decision.action == HiCacheAction.REVOKE:
+            # REVOKE: Cancel any ongoing prefetch, immediately produce outcome
+            if req_id in self.ongoing_prefetch:
+                _, _, _, operation = self.ongoing_prefetch[req_id]
+                operation.mark_terminate()
+            outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=decision.seq_id,
+                final_state=HiCacheFinalState.REVOKED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=decision.prefix_length,
+            )
+            return outcome
+
+        # PREFETCH: Execute the prefetch using decision.token_ids
+        prefetch_length = decision.planned_tokens
+        token_ids = decision.token_ids
+
+        if prefetch_length == 0 or len(token_ids) == 0:
+            # Empty prefetch, treat as skip
+            outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=decision.seq_id,
+                final_state=HiCacheFinalState.SKIPPED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=decision.prefix_length,
+            )
+            return outcome
+
+        # Allocate host memory
+        last_host_node.protect_host()
+        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            self.evict_host(prefetch_length)
+            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
+        if host_indices is None:
+            last_host_node.release_host()
+            # Failed to allocate host memory
+            outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=decision.seq_id,
+                final_state=HiCacheFinalState.FAILED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=decision.prefix_length,
+                failure_reason=HiCacheFailureReason.HOST_ALLOC_FAILED,
+            )
+            logger.warning(
+                f"Prefetch failed for {req_id}: host memory allocation failed"
+            )
+            return outcome
+
+        # Start prefetch operation
+        operation = self.cache_controller.prefetch(
+            req_id, host_indices, token_ids, decision.last_hash, prefix_keys
+        )
+        self.ongoing_prefetch[req_id] = (
+            last_host_node,
+            token_ids,
+            host_indices,
+            operation,
+        )
+        self.cache_controller.prefetch_tokens_occupied += len(token_ids)
+
+        # Store decision info for outcome generation later
+        # The outcome will be produced in check_prefetch_progress
+        return None
+
+    def execute_given_decision(
+        self,
+        req_id: str,
+        decision: HiCacheDecision,
+        local_prefix_length: int,
+        last_host_node: TreeNode,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> Optional[HiCacheOutcome]:
+        """
+        Execute a decision received from the previous rank (rank > 0 only).
+
+        This method verifies the decision's prefix_length against local match_prefix
+        result, then executes the decision.
+
+        Args:
+            req_id: Request identifier.
+            decision: The HiCacheDecision received from previous rank.
+            local_prefix_length: Result of local match_prefix.
+            last_host_node: The last matched host node.
+            prefix_keys: Prefix keys for storage backend.
+
+        Returns:
+            HiCacheOutcome if execution completed immediately or failed verification,
+            None if prefetch is in progress.
+        """
+        if not self.protocol_manager.is_enabled:
+            return None
+
+        # Store the decision
+        is_new = self.protocol_manager.store_decision(decision)
+        if not is_new:
+            logger.debug(
+                f"Duplicate decision for {req_id}:{decision.seq_id}, ignoring"
+            )
+            return None
+
+        # Verify prefix_length consistency
+        if local_prefix_length != decision.prefix_length:
+            logger.warning(
+                f"Prefix length mismatch for {req_id}: "
+                f"local={local_prefix_length}, decision={decision.prefix_length}"
+            )
+            outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=decision.seq_id,
+                final_state=HiCacheFinalState.FAILED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=local_prefix_length,
+                failure_reason=HiCacheFailureReason.MISMATCH,
+            )
+            return outcome
+
+        # Mark any old prefetch as superseded
+        self.protocol_manager.mark_old_prefetch_superseded(req_id, decision.seq_id)
+
+        # Execute the decision
+        return self.execute_prefetch_decision(
+            req_id=req_id,
+            last_host_node=last_host_node,
+            decision=decision,
+            prefix_keys=prefix_keys,
+        )
+
+    def check_prefetch_progress_with_outcome(
+        self, req_id: str, decision: Optional[HiCacheDecision] = None
+    ) -> Optional[HiCacheOutcome]:
+        """
+        Check prefetch progress and produce HiCacheOutcome when complete.
+
+        This extends check_prefetch_progress to produce protocol outcomes.
+
+        Args:
+            req_id: Request identifier.
+            decision: The decision being executed (for seq_id).
+
+        Returns:
+            HiCacheOutcome if prefetch completed, None if still in progress.
+        """
+        if req_id not in self.ongoing_prefetch:
+            # No ongoing prefetch, check if it was revoked
+            return None
+
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+            req_id
+        ]
+
+        if operation.host_indices is None:
+            # Prefetch has not been issued
+            return None
+
+        if not self.can_terminate_prefetch(operation):
+            return None
+
+        # Terminate and get results
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
+        # Synchronize across TP workers
+        min_completed_tokens = completed_tokens
+        if self.tp_world_size > 1:
+            completed_tokens_tensor = torch.tensor(
+                min_completed_tokens, dtype=torch.int
+            )
+            torch.distributed.all_reduce(
+                completed_tokens_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            min_completed_tokens = completed_tokens_tensor.item()
+
+        # Insert into host radix tree
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
+            written_indices,
+            hash_value[: min_completed_tokens // self.page_size],
+        )
+
+        # Free memory
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
+        last_host_node.release_host()
+        del self.ongoing_prefetch[req_id]
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        # Track tokens actually loaded from storage
+        loaded_from_storage = min_completed_tokens - matched_length
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+
+        # Get seq_id from decision if available, otherwise use request state
+        seq_id = -1
+        if decision is not None:
+            seq_id = decision.seq_id
+        else:
+            state = self.protocol_manager.get_request_state(req_id)
+            if state is not None:
+                seq_id = state.latest_decision_seq_id
+
+        # Calculate applied tokens (what was actually applied to the tree)
+        applied_tokens = min_completed_tokens - matched_length
+
+        # Determine final state
+        if min_completed_tokens == 0:
+            final_state = HiCacheFinalState.FAILED
+            failure_reason = HiCacheFailureReason.STORAGE_ERROR
+        else:
+            final_state = HiCacheFinalState.COMPLETED
+            failure_reason = None
+
+        # Create outcome
+        outcome = self.protocol_manager.create_outcome(
+            request_id=req_id,
+            seq_id=seq_id,
+            final_state=final_state,
+            completed_tokens=min_completed_tokens,
+            applied_tokens=applied_tokens,
+            local_prefix_length=len(fetched_token_ids) + matched_length,
+            failure_reason=failure_reason,
+        )
+
+        logger.debug(
+            f"Produced outcome for {req_id}:{seq_id} "
+            f"state={final_state.value}, completed={min_completed_tokens}, "
+            f"applied={applied_tokens}, pp_rank={self.pp_rank}"
+        )
+
+        return outcome
+
+    def receive_prev_rank_outcome(self, outcome: HiCacheOutcome):
+        """
+        Store an outcome received from the previous rank (for alignment).
+
+        Args:
+            outcome: The HiCacheOutcome received from previous rank.
+        """
+        if not self.protocol_manager.is_enabled:
+            return
+
+        self.protocol_manager.store_outcome(outcome)
+        logger.debug(
+            f"Received outcome from rank {outcome.source_pp_rank} for "
+            f"{outcome.request_id}:{outcome.seq_id}, state={outcome.final_state}"
+        )
+
+    def check_outcome_alignment(
+        self, req_id: str, seq_id: int
+    ) -> tuple[bool, Optional[HiCacheOutcome]]:
+        """
+        Check if outcomes are aligned and produce failed outcome if not.
+
+        Args:
+            req_id: Request identifier.
+            seq_id: Sequence identifier.
+
+        Returns:
+            Tuple of (is_aligned, failed_outcome).
+            If aligned, failed_outcome is None.
+            If not aligned, failed_outcome contains the mismatch details.
+        """
+        if not self.protocol_manager.is_enabled:
+            return True, None
+
+        aligned, failure_reason = self.protocol_manager.check_outcome_alignment(
+            req_id, seq_id
+        )
+
+        if aligned:
+            self.protocol_manager.end_alignment_wait(req_id, seq_id)
+            return True, None
+
+        if failure_reason is not None:
+            # Produce failed outcome for alignment mismatch
+            local_outcome = self.protocol_manager.get_local_outcome(req_id, seq_id)
+            local_prefix_length = 0
+            if local_outcome is not None:
+                local_prefix_length = local_outcome.local_prefix_length
+
+            failed_outcome = self.protocol_manager.create_outcome(
+                request_id=req_id,
+                seq_id=seq_id,
+                final_state=HiCacheFinalState.FAILED,
+                completed_tokens=0,
+                applied_tokens=0,
+                local_prefix_length=local_prefix_length,
+                failure_reason=failure_reason,
+            )
+            return False, failed_outcome
+
+        # Not yet ready (waiting for outcome from previous rank)
+        return False, None
+
+    def is_ready_for_forward(self, req_id: str) -> bool:
+        """
+        Check if a request is ready to enter batch forward.
+
+        A request is ready when:
+        1. Protocol is disabled (pp_size == 1), OR
+        2. The latest decision's outcome is complete and aligned with previous rank
+
+        Args:
+            req_id: Request identifier.
+
+        Returns:
+            True if ready for forward.
+        """
+        if not self.protocol_manager.is_enabled:
+            return True
+
+        state = self.protocol_manager.get_request_state(req_id)
+        if state is None:
+            # No HiCache decision for this request
+            return True
+
+        if state.terminal_state != "none":
+            # Request in terminal state
+            return False
+
+        seq_id = state.latest_decision_seq_id
+        if seq_id < 0:
+            # No decision yet
+            return True
+
+        return self.protocol_manager.is_ready_for_forward(req_id, seq_id)
+
+    def handle_global_failed_notice(self, notice):
+        """
+        Handle a GlobalFailedNotice received from rank 0.
+
+        Args:
+            notice: The GlobalFailedNotice.
+        """
+        if not self.protocol_manager.is_enabled:
+            return
+
+        from sglang.srt.mem_cache.hicache_protocol import GlobalFailedNotice
+
+        if not isinstance(notice, GlobalFailedNotice):
+            logger.warning(f"Invalid notice type: {type(notice)}")
+            return
+
+        req_id = notice.request_id
+        logger.info(
+            f"Received GlobalFailedNotice for {req_id}:{notice.seq_id}, "
+            f"reason={notice.reason}, source_rank={notice.source_pp_rank}"
+        )
+
+        # Mark request as failed
+        self.protocol_manager.mark_request_failed(req_id)
+
+        # Clean up any ongoing prefetch
+        if req_id in self.ongoing_prefetch:
+            last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+                req_id
+            ]
+            if operation.host_indices is not None:
+                operation.mark_terminate()
+            last_host_node.release_host()
+            if host_indices is not None:
+                self.cache_controller.append_host_mem_release(host_indices)
+            del self.ongoing_prefetch[req_id]
+            self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+    def handle_release_notice(self, notice):
+        """
+        Handle a ReleaseNotice received from rank 0.
+
+        Args:
+            notice: The ReleaseNotice.
+        """
+        if not self.protocol_manager.is_enabled:
+            return
+
+        from sglang.srt.mem_cache.hicache_protocol import ReleaseNotice
+
+        if not isinstance(notice, ReleaseNotice):
+            logger.warning(f"Invalid notice type: {type(notice)}")
+            return
+
+        req_id = notice.request_id
+        logger.debug(f"Received ReleaseNotice for {req_id}:{notice.seq_id}")
+
+        # Mark request as released
+        self.protocol_manager.mark_request_released(req_id)
+
+        # Clean up protocol state
+        self.protocol_manager.cleanup_request(req_id)
+
+    def cleanup_protocol_state(self, req_id: str):
+        """
+        Clean up protocol state for a completed or aborted request.
+
+        Args:
+            req_id: Request identifier.
+        """
+        if not self.protocol_manager.is_enabled:
+            return
+
+        self.protocol_manager.cleanup_request(req_id)
+
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
     ):
@@ -1411,11 +1976,16 @@ class HiRadixCache(RadixCache):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
+        # Clean up HiCache protocol state
+        self.cleanup_protocol_state(rid)
+
         if rid not in self.ongoing_prefetch:
             return
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
+            del self.ongoing_prefetch[rid]
+            last_host_node.release_host()
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)

@@ -130,6 +130,12 @@ class SchedulerStats:
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
 
+    # HiCache PP consistency protocol metrics
+    hicache_decision_count: int = 0
+    hicache_outcome_completed_count: int = 0
+    hicache_outcome_failed_count: int = 0
+    hicache_outcome_alignment_latency_ms: float = 0.0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -652,6 +658,29 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+            # HiCache PP consistency protocol metrics
+            self.hicache_decision_count_total = Counter(
+                name="sglang:hicache_decision_count_total",
+                documentation="Total number of HiCache decisions generated.",
+                labelnames=labels.keys(),
+            )
+            self.hicache_outcome_completed_total = Counter(
+                name="sglang:hicache_outcome_completed_total",
+                documentation="Total number of completed HiCache outcomes.",
+                labelnames=labels.keys(),
+            )
+            self.hicache_outcome_failed_total = Counter(
+                name="sglang:hicache_outcome_failed_total",
+                documentation="Total number of failed HiCache outcomes.",
+                labelnames=labels.keys(),
+            )
+            self.hicache_outcome_alignment_latency = Histogram(
+                name="sglang:hicache_outcome_alignment_latency_seconds",
+                documentation="Latency of HiCache outcome alignment in seconds.",
+                labelnames=labels.keys(),
+                buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -1046,6 +1075,24 @@ class SchedulerMetricsCollector:
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+
+            # HiCache PP consistency protocol metrics
+            if stats.hicache_decision_count > 0:
+                self.hicache_decision_count_total.labels(**self.labels).inc(
+                    stats.hicache_decision_count
+                )
+            if stats.hicache_outcome_completed_count > 0:
+                self.hicache_outcome_completed_total.labels(**self.labels).inc(
+                    stats.hicache_outcome_completed_count
+                )
+            if stats.hicache_outcome_failed_count > 0:
+                self.hicache_outcome_failed_total.labels(**self.labels).inc(
+                    stats.hicache_outcome_failed_count
+                )
+            if stats.hicache_outcome_alignment_latency_ms > 0:
+                self.hicache_outcome_alignment_latency.labels(**self.labels).observe(
+                    stats.hicache_outcome_alignment_latency_ms / 1000.0
+                )
 
         self._log_gauge(
             self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
