@@ -313,7 +313,10 @@ __global__ void prepare_swap_kernel(
     if (has_valid_token) {
       my_token = s_top_k_tokens[my_token_idx];
       // Padding entries (token_idx < 0) are neither hits nor misses — skip them.
-      is_miss = (my_token != TOKEN_HIT) && (my_token >= 0);
+      // Also skip tokens with uninitialized host cache locs (-1) — defensive check
+      // against race conditions in speculative decoding host pool bookkeeping.
+      bool has_valid_host_loc = (my_token >= 0) && (req_host_cache_locs[my_token] >= 0);
+      is_miss = (my_token != TOKEN_HIT) && has_valid_host_loc;
     }
 
     if (has_valid_chunk) {
@@ -405,6 +408,11 @@ __global__ void execute_h2d_copy_kernel(
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int64_t src_loc = req_miss_src[miss_idx];
     const int64_t dst_loc = req_miss_dst[miss_idx];
+
+    // Defensive check: skip invalid locs (uninitialized host pool entries).
+    // This should not happen if prepare_swap_kernel filtered correctly,
+    // but provides a second line of defense against CUDA illegal memory access.
+    if (src_loc < 0 || dst_loc < 0) continue;
 
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;

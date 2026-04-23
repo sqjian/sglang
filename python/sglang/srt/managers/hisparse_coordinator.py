@@ -23,6 +23,7 @@ from sglang.jit_kernel.hisparse import (
     finalize_accepted,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 logger = logging.getLogger(__name__)
 
@@ -669,7 +670,9 @@ class HiSparseCoordinator:
         """
         # Ensure any pending D2H backup from finalize_accepted_tokens has completed
         # before reading host cache data.
-        device_module.current_stream().wait_event(self.d2h_finish_event)
+        # Skip during CUDA graph capture mode since stream synchronization is incompatible
+        if not get_is_capture_mode():
+            device_module.current_stream().wait_event(self.d2h_finish_event)
 
         # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32 or int64.
         if req_pool_indices.dtype != torch.int64:
@@ -730,6 +733,9 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> None:
         """Launch H2D copy on the transfer stream. Non-blocking."""
+        # Skip during CUDA graph capture mode - H2D operations can't be captured
+        if get_is_capture_mode():
+            return
         nvtx.range_push(f"hisparse::h2d_async L{layer_id}")
         if logger.isEnabledFor(logging.DEBUG):
             hit = hit_count.item()
@@ -781,6 +787,9 @@ class HiSparseCoordinator:
 
     def wait_h2d(self) -> None:
         """Block current stream until H2D transfer completes."""
+        # Skip during CUDA graph capture mode
+        if get_is_capture_mode():
+            return
         nvtx.range_push("hisparse::wait_h2d")
         device_module.current_stream().wait_event(self.h2d_finish_event)
         nvtx.range_pop()
@@ -858,6 +867,9 @@ class HiSparseCoordinator:
         3. Clears device mapping for host-only tokens.
         4. Sets _skip_first_backup for each request.
         """
+        # Skip during CUDA graph capture mode - host operations can't be captured
+        if get_is_capture_mode():
+            return
         if accepted_cache_locs.numel() == 0:
             return
 

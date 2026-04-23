@@ -71,8 +71,11 @@ def create_extend_after_decode_spec_info(
     seq_length = tl.load(seq_lens + pid)
     accept_length = tl.load(accept_lens + pid)
 
+    offset_mask = offsets < pid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_offsets = tl.where(offset_mask, offsets, 0)
     accept_len_cumsum = tl.sum(
-        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
+        tl.load(accept_lens + safe_offsets, mask=offset_mask, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
     mask = offsets < accept_length
@@ -100,8 +103,11 @@ def assign_req_to_token_pool(
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
     length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
+    offset_mask = length_offset < pid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_length_offset = tl.where(offset_mask, length_offset, 0)
+    start = tl.load(start_offset + safe_length_offset, mask=offset_mask, other=0)
+    end = tl.load(end_offset + safe_length_offset, mask=offset_mask, other=0)
     out_offset = tl.sum(end - start, axis=0)
 
     out_cache_ptr = out_cache_loc + out_offset
@@ -112,8 +118,11 @@ def assign_req_to_token_pool(
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
     for _ in range(num_loop):
         mask = save_offset < kv_end
-        data = tl.load(out_cache_ptr + load_offset, mask=mask)
-        tl.store(token_pool + save_offset, data, mask=mask)
+        # Use safe offsets to prevent out-of-bounds access
+        safe_load_offset = tl.where(mask, load_offset, 0)
+        safe_save_offset = tl.where(mask, save_offset, kv_start)
+        data = tl.load(out_cache_ptr + safe_load_offset, mask=mask)
+        tl.store(token_pool + safe_save_offset, data, mask=mask)
         save_offset += BLOCK_SIZE
         load_offset += BLOCK_SIZE
 
@@ -165,7 +174,10 @@ def assign_draft_cache_locs(
     else:
         bs_offset = tl.arange(0, bs_upper)
         copy_len = tl.load(extend_lens + pid)
-        cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
+        offset_mask = bs_offset < pid
+        # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+        safe_bs_offset = tl.where(offset_mask, bs_offset, 0)
+        cum_copy_len = tl.sum(tl.load(extend_lens + safe_bs_offset, mask=offset_mask))
         out_cache_ptr = out_cache_loc + cum_copy_len
 
     # Part 1: Copy from out_cache_loc to req_to_token
@@ -175,8 +187,10 @@ def assign_draft_cache_locs(
     for i in range(num_loop):
         copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = copy_offset < copy_len
-        data = tl.load(out_cache_ptr + copy_offset, mask=mask)
-        tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
+        # Use safe offsets to prevent out-of-bounds access
+        safe_copy_offset = tl.where(mask, copy_offset, 0)
+        data = tl.load(out_cache_ptr + safe_copy_offset, mask=mask)
+        tl.store(token_pool + kv_start + safe_copy_offset, data, mask=mask)
     if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
@@ -276,7 +290,10 @@ def generate_draft_decode_kv_indices(
     iters += 1
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
+    offset_mask = load_offset < bid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_load_offset = tl.where(offset_mask, load_offset, 0)
+    seq_lens = tl.load(paged_kernel_lens + safe_load_offset, mask=offset_mask, other=0)
     seq_len = tl.load(paged_kernel_lens + bid)
     cum_seq_len = tl.sum(seq_lens)
 
@@ -289,15 +306,20 @@ def generate_draft_decode_kv_indices(
     num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
     for _ in range(num_loop):
         mask = kv_offset < seq_len
-        data = tl.load(token_pool_ptr + kv_offset, mask=mask)
-        tl.store(kv_ptr + kv_offset, data, mask=mask)
+        # Use safe offsets to prevent out-of-bounds access
+        safe_kv_offset = tl.where(mask, kv_offset, 0)
+        data = tl.load(token_pool_ptr + safe_kv_offset, mask=mask)
+        tl.store(kv_ptr + safe_kv_offset, data, mask=mask)
         kv_offset += BLOCK_SIZE
 
     extend_offset = tl.arange(0, iter_upper)
+    extend_mask = extend_offset < iters
     if page_size == 1 or topk == 1:
+        # Use safe offset for load
+        safe_extend_offset = tl.where(extend_mask, extend_offset, 0)
         extend_data = tl.load(
-            token_pool_ptr + seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
-            mask=extend_offset < iters,
+            token_pool_ptr + seq_len + topk_id * num_steps + safe_extend_offset,
+            mask=extend_mask,
         )
     else:
         prefix_len = seq_len
@@ -309,12 +331,16 @@ def generate_draft_decode_kv_indices(
         start = (
             prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
         )
+        # Use safe offset for load
+        safe_extend_offset = tl.where(extend_mask, extend_offset, 0)
         extend_data = tl.load(
-            token_pool_ptr + start + extend_offset,
-            mask=extend_offset < iters,
+            token_pool_ptr + start + safe_extend_offset,
+            mask=extend_mask,
         )
 
-    tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
+    # Use safe offset for store
+    safe_extend_offset = tl.where(extend_mask, extend_offset, 0)
+    tl.store(kv_ptr + seq_len + safe_extend_offset, extend_data, mask=extend_mask)
 
     # Update kv_indptr
     bs_offset = tl.arange(0, num_tokens_upper)
@@ -322,7 +348,10 @@ def generate_draft_decode_kv_indices(
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
+    pos_mask = bs_offset < zid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_bs_offset = tl.where(pos_mask, bs_offset, 0)
+    positions = tl.load(positions + safe_bs_offset, mask=pos_mask, other=0)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 
@@ -366,9 +395,12 @@ def get_target_cache_loc(
     bid = tl.program_id(axis=0)
     offset = tl.arange(0, num_verify_tokens_upper)
     bs_offset = tl.arange(0, bs_upper)
+    bs_mask = bs_offset < bid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_bs_offset = tl.where(bs_mask, bs_offset, 0)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(accept_length + safe_bs_offset, mask=bs_mask)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
     copy_len = tl.load(accept_length + bid) + 1
     out_cache_loc_row = tl.load(
@@ -381,7 +413,7 @@ def get_target_cache_loc(
     )
 
     # write the second part to to_free_num_pages
-    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
+    to_free_num_slots_all = tl.load(to_free_num_slots + safe_bs_offset, mask=bs_mask)
     to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
     out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
     to_free_slots_start = tl.sum(to_free_num_slots_all)
@@ -429,12 +461,15 @@ def filter_finished_cache_loc_kernel(
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
+    bs_mask = bs_offset < bid
+    # Use safe index 0 when mask=False to prevent triton from pre-accessing invalid addresses
+    safe_bs_offset = tl.where(bs_mask, bs_offset, 0)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_length_all = tl.load(accept_length + safe_bs_offset, mask=bs_mask)
     old_start = tl.sum(accept_length_all) + bid
 
     accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+        accept_length_filter + safe_bs_offset, mask=bs_mask
     )
     new_start = tl.sum(accept_length_filter_all)
 
