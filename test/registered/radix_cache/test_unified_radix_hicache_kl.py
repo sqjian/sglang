@@ -33,7 +33,7 @@ DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 GLM5_MODEL = "zai-org/GLM-5-FP8"
 GLM5_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=900, suite="nightly-8-gpu-h200", nightly=True)
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
