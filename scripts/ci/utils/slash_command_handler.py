@@ -445,7 +445,6 @@ def handle_rerun_stage(
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd-nondeterministic",
-        "stage-b-test-1-gpu-small-amd-mi35x",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "multimodal-gen-test-1-gpu-amd",
