@@ -388,6 +388,31 @@ class DecodePreallocQueue:
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
+            if self.scheduler.enable_hisparse:
+                logical_size = getattr(
+                    self.token_to_kv_pool_allocator, "size_full", None
+                )
+                if logical_size is None:
+                    logical_allocator = getattr(
+                        self.token_to_kv_pool_allocator,
+                        "logical_attn_allocator",
+                        None,
+                    )
+                    logical_size = getattr(logical_allocator, "size", None)
+                if logical_size is not None:
+                    logical_capacity = int(logical_size) + int(
+                        getattr(self.token_to_kv_pool_allocator, "page_size", 1)
+                    )
+                    draft_capacity = int(
+                        getattr(self.draft_token_to_kv_pool, "size", 0)
+                    ) + int(getattr(self.draft_token_to_kv_pool, "page_size", 1))
+                    if draft_capacity < logical_capacity:
+                        raise RuntimeError(
+                            "HiSparse draft KV pool is too small for direct-to-host "
+                            "MTP transfer destination indices: "
+                            f"draft_capacity={draft_capacity}, "
+                            f"logical_capacity={logical_capacity}"
+                        )
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
@@ -445,6 +470,8 @@ class DecodePreallocQueue:
         """Add a request to the pending queue."""
         if self._check_if_req_exceed_kv_capacity(req):
             return
+        if not is_retracted and self._abort_if_decode_queue_full(req):
+            return
 
         if is_retracted:
             req.retraction_mb_id = None
@@ -485,14 +512,54 @@ class DecodePreallocQueue:
 
         return prefix_indices, len(prefix_indices)
 
+    def _abort_if_decode_queue_full(self, req: Req) -> bool:
+        max_queued_requests = self.scheduler.max_queued_requests
+        if (
+            max_queued_requests is None
+            or self._decode_inflight_request_count() + 1 <= max_queued_requests
+        ):
+            return False
+
+        message = "The disaggregation decode request queue is full."
+        logger.warning("%s Rejecting request %s.", message, req.rid)
+        prepare_abort(req, message, status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+        self.scheduler.stream_output([req], req.return_logprob)
+        return True
+
+    def _decode_inflight_request_count(self) -> int:
+        req_ids = set()
+
+        def add_req(req: Optional[Req]) -> None:
+            if req is not None:
+                req_ids.add(id(req))
+
+        for decode_req in self.queue:
+            add_req(decode_req.req)
+        for decode_req in self.pending_reqs:
+            add_req(decode_req.req)
+        for decode_req in self.transfer_queue.queue:
+            add_req(decode_req.req)
+        for req in self.retracted_queue:
+            add_req(req)
+        for req in self.scheduler.waiting_queue:
+            add_req(req)
+        for req in getattr(self.scheduler, "hisparse_admit_pending_queue", []):
+            add_req(req)
+
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        if running_batch is not None:
+            for req in getattr(running_batch, "reqs", []):
+                add_req(req)
+
+        return len(req_ids)
+
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+        if req.disagg_prefill_dp_rank is not None:
+            return req.disagg_prefill_dp_rank
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
         if prefill_info is None:
             return None
-
-        if req.disagg_prefill_dp_rank is not None:
-            return req.disagg_prefill_dp_rank
 
         if prefill_info.dp_size == 1:
             return 0
@@ -769,6 +836,11 @@ class DecodePreallocQueue:
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
+        hisparse_allocatable_device_buffer = (
+            self._hisparse_allocatable_device_buffer_size()
+            if self.scheduler.enable_hisparse
+            else None
+        )
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -888,6 +960,19 @@ class DecodePreallocQueue:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            if self.scheduler.enable_hisparse:
+                assert hisparse_allocatable_device_buffer is not None
+                device_buffer_alloc_size = (
+                    self._estimate_hisparse_device_buffer_alloc_size(
+                        decode_req.req, use_allocated_len=False
+                    )
+                )
+                if device_buffer_alloc_size > hisparse_allocatable_device_buffer:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    break
+                hisparse_allocatable_device_buffer -= device_buffer_alloc_size
+
             dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -1000,6 +1085,44 @@ class DecodePreallocQueue:
         ]
 
         return preallocated_reqs, failed_reqs
+
+    def _hisparse_allocatable_device_buffer_size(self) -> int:
+        coordinator = self.scheduler.hisparse_coordinator
+        available = (
+            coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        return max(available - self._hisparse_reserved_device_buffer_size(), 0)
+
+    def _hisparse_reserved_device_buffer_size(self) -> int:
+        reserved = 0
+        for decode_req in self.transfer_queue.queue:
+            reserved += self._estimate_hisparse_device_buffer_alloc_size(
+                decode_req.req, use_allocated_len=True
+            )
+        for req in getattr(self.scheduler, "hisparse_admit_pending_queue", []):
+            reserved += self._estimate_hisparse_device_buffer_alloc_size(
+                req, use_allocated_len=True
+            )
+        return reserved
+
+    def _estimate_hisparse_device_buffer_alloc_size(
+        self, req: Req, use_allocated_len: bool
+    ) -> int:
+        if use_allocated_len:
+            kv_allocated_len = req.kv_allocated_len
+        else:
+            kv_allocated_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+
+        alloc_size, _ = (
+            self.scheduler.hisparse_coordinator.estimate_device_buffer_alloc_size_for_len(
+                kv_allocated_len,
+                req.sampling_params.max_new_tokens,
+                require_spec_extra_page=not self.scheduler.spec_algorithm.is_none(),
+            )
+        )
+        return alloc_size
 
     @property
     def num_tokens_pre_allocated(self):
@@ -1250,6 +1373,7 @@ class DecodePreallocQueue:
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
+            req.hisparse_exact_host_slots = self.draft_token_to_kv_pool is not None
             device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
                 prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
@@ -1259,12 +1383,28 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
+            # Allocate host indices for the RDMA transfer target. Draft KV
+            # transfer reuses dst_kv_indices, so host slots must match logical
+            # slots that draft attention later reads.
+            if self.draft_token_to_kv_pool is not None:
+                host_indices = coordinator.mem_pool_host.alloc_specific(kv_loc)
+            else:
+                host_indices = coordinator.mem_pool_host.alloc(fill_len)
             if host_indices is None:
+                if self.draft_token_to_kv_pool is not None:
+                    raise RuntimeError(
+                        "HiSparse host mem pool could not reserve logical KV "
+                        f"slots as draft KV destination indices for {fill_len} "
+                        f"tokens in _pre_alloc (req {req.rid}); "
+                        f"{coordinator.host_pool_debug_info(kv_loc)}"
+                    )
                 raise RuntimeError(
                     f"HiSparse host mem pool alloc failed for {fill_len} tokens "
-                    f"in _pre_alloc (req {req.rid})"
+                    f"in _pre_alloc (req {req.rid}); "
+                    f"{coordinator.host_pool_debug_info(kv_loc)}"
                 )
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
@@ -1628,6 +1768,72 @@ class SchedulerDisaggregationDecodeMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def _get_hisparse_admit_pending_queue(self: Scheduler):
+        if not hasattr(self, "hisparse_admit_pending_queue"):
+            self.hisparse_admit_pending_queue = deque()
+        return self.hisparse_admit_pending_queue
+
+    def _release_hisparse_admit_pending_req(
+        self: Scheduler, req: Req, stream_output: bool
+    ) -> None:
+        self.hisparse_coordinator.request_finished(req)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if stream_output:
+            self.stream_output([req], req.return_logprob)
+
+    def _drain_hisparse_admit_pending_queue(self: Scheduler) -> List[Req]:
+        pending_queue = self._get_hisparse_admit_pending_queue()
+        if not pending_queue:
+            return []
+
+        require_spec_extra_page = not self.spec_algorithm.is_none()
+        admitted_reqs = []
+        while pending_queue:
+            req = pending_queue[0]
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                pending_queue.popleft()
+                self._release_hisparse_admit_pending_req(req, stream_output=True)
+                continue
+
+            if not self.hisparse_coordinator.try_admit_request_direct(
+                req, require_spec_extra_page=require_spec_extra_page
+            ):
+                break
+
+            pending_queue.popleft()
+            admitted_reqs.append(req)
+
+        return admitted_reqs
+
+    def _admit_hisparse_transferred_reqs(
+        self: Scheduler, transferred_reqs: List[Req]
+    ) -> List[Req]:
+        if not transferred_reqs:
+            return []
+
+        pending_queue = self._get_hisparse_admit_pending_queue()
+        if pending_queue:
+            pending_queue.extend(transferred_reqs)
+            return []
+
+        require_spec_extra_page = not self.spec_algorithm.is_none()
+        admitted_reqs = []
+        for i, req in enumerate(transferred_reqs):
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self._release_hisparse_admit_pending_req(req, stream_output=True)
+                continue
+
+            if self.hisparse_coordinator.try_admit_request_direct(
+                req, require_spec_extra_page=require_spec_extra_page
+            ):
+                admitted_reqs.append(req)
+                continue
+
+            pending_queue.extend(transferred_reqs[i:])
+            break
+
+        return admitted_reqs
+
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -1753,6 +1959,8 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
+        if self.enable_hisparse:
+            self.waiting_queue.extend(self._drain_hisparse_admit_pending_queue())
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -1772,9 +1980,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
             if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(transferred_reqs)
+                self.waiting_queue.extend(
+                    self._admit_hisparse_transferred_reqs(transferred_reqs)
+                )
             else:
                 self.waiting_queue.extend(transferred_reqs)

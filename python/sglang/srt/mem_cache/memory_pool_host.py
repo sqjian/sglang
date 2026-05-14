@@ -279,11 +279,38 @@ class HostKVCache(abc.ABC):
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self.mem_state[select_index.to(device=self.mem_state.device)] = 1
 
         return select_index
 
     @synchronized
+    def alloc_specific(self, indices: torch.Tensor) -> Optional[torch.Tensor]:
+        indices = indices.detach().to(dtype=torch.int64, device="cpu")
+        if indices.numel() % self.page_size != 0:
+            raise AssertionError(
+                "The requested indices should be a multiple of the page size."
+            )
+        if indices.numel() == 0:
+            return indices
+        if (
+            torch.any(indices < 0).item()
+            or torch.any(indices >= self.size).item()
+            or torch.unique(indices).numel() != indices.numel()
+        ):
+            return None
+
+        state_indices = indices.to(device=self.mem_state.device)
+        if torch.any(self.mem_state[state_indices] != 0).item():
+            return None
+
+        self.mem_state[state_indices] = 1
+        self.free_slots = self.free_slots[~torch.isin(self.free_slots, indices)]
+        return indices
+
+    @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        indices = indices.to(dtype=torch.int64)
+        self.mem_state[indices.to(device=self.mem_state.device)] = 0
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
 
@@ -1348,11 +1375,14 @@ class MambaPoolHost(HostKVCache):
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        self.mem_state[select_index.to(device=self.mem_state.device)] = 1
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices])
+        indices = indices.to(dtype=torch.int64)
+        self.mem_state[indices.to(device=self.mem_state.device)] = 0
+        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
 
     def get_size_per_token(self):
@@ -1738,6 +1768,9 @@ class HostPoolGroup:
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         return self.anchor_entry.host_pool.alloc(need_size)
+
+    def alloc_specific(self, indices: torch.Tensor) -> Optional[torch.Tensor]:
+        return self.anchor_entry.host_pool.alloc_specific(indices)
 
     def free(self, indices: torch.Tensor) -> int:
         return self.anchor_entry.host_pool.free(indices)

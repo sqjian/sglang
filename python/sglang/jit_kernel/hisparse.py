@@ -20,9 +20,8 @@ def _jit_sparse_module(
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
 ) -> Module:
-    template_args = make_cpp_args(
-        block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
-    )
+    template_args = make_cpp_args(block_size, num_top_k, hot_buffer_size, is_mla)
+    h2d_template_args = make_cpp_args(block_size, is_mla, is_dsv4_layout)
     cache_args = make_cpp_args(
         item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
     )
@@ -32,10 +31,129 @@ def _jit_sparse_module(
         cuda_files=["hisparse.cuh"],
         cuda_wrappers=[
             (
-                "load_cache_to_device_buffer",
-                f"load_cache_to_device_buffer<{template_args}>",
-            )
+                "prepare_swap",
+                f"prepare_swap<{template_args}>",
+            ),
+            (
+                "execute_h2d_copy",
+                f"execute_h2d_copy<{h2d_template_args}>",
+            ),
         ],
+    )
+
+
+@functools.cache
+def _jit_hisparse_utils_module() -> Module:
+    return load_jit(
+        "hisparse_utils",
+        cuda_files=["hisparse_utils.cuh"],
+        cuda_wrappers=[
+            ("gather_variable_length", "gather_variable_length<256>"),
+            ("finalize_accepted", "finalize_accepted<256>"),
+        ],
+    )
+
+
+def prepare_swap_mla(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    hit_device_locs: torch.Tensor,
+    miss_device_locs: torch.Tensor,
+    hit_count: torch.Tensor,
+    miss_src_locs: torch.Tensor,
+    miss_dst_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+    is_dsv4_layout: bool = False,
+) -> None:
+    assert (
+        hot_buffer_size >= num_top_k
+    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla=True,
+        is_dsv4_layout=is_dsv4_layout,
+    )
+
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
+        )
+
+    module.prepare_swap(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        top_k_device_locs,
+        hit_device_locs,
+        miss_device_locs,
+        hit_count,
+        miss_src_locs,
+        miss_dst_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+    )
+
+
+def execute_h2d_copy_mla(
+    miss_src_locs: torch.Tensor,
+    miss_dst_locs: torch.Tensor,
+    hit_count: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+    is_dsv4_layout: bool = False,
+) -> None:
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla=True,
+        is_dsv4_layout=is_dsv4_layout,
+    )
+
+    empty = torch.empty(0)
+
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [miss_src_locs.size(0)], dtype=torch.int32, device=miss_src_locs.device
+        )
+
+    module.execute_h2d_copy(
+        miss_src_locs,
+        miss_dst_locs,
+        hit_count,
+        host_cache,
+        empty,
+        device_buffer,
+        empty,
+        num_real_reqs,
+        num_top_k,
+        item_size_bytes,
     )
 
 
@@ -59,42 +177,52 @@ def _load_cache_to_device_buffer_mla(
     block_size: int,
     num_real_reqs: torch.Tensor | None,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    hit_device_locs = torch.full_like(top_k_device_locs, -1)
+    miss_device_locs = torch.full_like(top_k_device_locs, -1)
+    hit_count = torch.empty(
+        (top_k_tokens.size(0),), dtype=torch.int32, device=top_k_tokens.device
+    )
+    miss_src_locs = torch.empty(
+        (top_k_tokens.size(0), num_top_k),
+        dtype=torch.int64,
+        device=top_k_tokens.device,
+    )
+    miss_dst_locs = torch.empty_like(miss_src_locs)
 
-    module = _jit_sparse_module(
-        item_size_bytes,
-        block_size,
-        num_top_k,
-        hot_buffer_size,
-        is_mla=True,
+    prepare_swap_mla(
+        top_k_tokens=top_k_tokens,
+        device_buffer_tokens=device_buffer_tokens,
+        host_cache_locs=host_cache_locs,
+        device_buffer_locs=device_buffer_locs,
+        top_k_device_locs=top_k_device_locs,
+        hit_device_locs=hit_device_locs,
+        miss_device_locs=miss_device_locs,
+        hit_count=hit_count,
+        miss_src_locs=miss_src_locs,
+        miss_dst_locs=miss_dst_locs,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        lru_slots=lru_slots,
+        item_size_bytes=item_size_bytes,
+        num_top_k=num_top_k,
+        hot_buffer_size=hot_buffer_size,
+        page_size=page_size,
+        block_size=block_size,
+        num_real_reqs=num_real_reqs,
         is_dsv4_layout=is_dsv4_layout,
     )
-
-    empty = torch.empty(0)
-
-    if num_real_reqs is None:
-        num_real_reqs = torch.tensor(
-            [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
-        )
-
-    module.load_cache_to_device_buffer(
-        top_k_tokens,
-        device_buffer_tokens,
-        host_cache_locs,
-        device_buffer_locs,
-        host_cache,
-        empty,
-        device_buffer,
-        empty,
-        top_k_device_locs,
-        req_pool_indices,
-        seq_lens,
-        lru_slots,
-        num_real_reqs,
-        page_size,
-        item_size_bytes,
+    execute_h2d_copy_mla(
+        miss_src_locs=miss_src_locs,
+        miss_dst_locs=miss_dst_locs,
+        hit_count=hit_count,
+        host_cache=host_cache,
+        device_buffer=device_buffer,
+        item_size_bytes=item_size_bytes,
+        num_top_k=num_top_k,
+        hot_buffer_size=hot_buffer_size,
+        block_size=block_size,
+        num_real_reqs=num_real_reqs,
+        is_dsv4_layout=is_dsv4_layout,
     )
 
 
@@ -116,7 +244,7 @@ def load_cache_to_device_buffer_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
 ) -> None:
-    """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
+    """Generic MLA hisparse swap-in: device + host both linear."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
         top_k_tokens=top_k_tokens,
@@ -156,7 +284,7 @@ def load_cache_to_device_buffer_dsv4_mla(
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
 ) -> None:
-    """DSv4 hisparse swap-in: page-padded device + linear host (kvcacheio.cuh layout)."""
+    """DSv4 hisparse swap-in: page-padded device + linear host."""
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=True,
         top_k_tokens=top_k_tokens,
@@ -175,4 +303,54 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+    )
+
+
+def gather_variable_length(
+    buffer: torch.Tensor,
+    req_indices: torch.Tensor,
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
+    output: torch.Tensor,
+    start_col: int,
+) -> None:
+    module = _jit_hisparse_utils_module()
+    module.gather_variable_length(
+        buffer,
+        req_indices,
+        counts,
+        offsets,
+        output,
+        start_col,
+    )
+
+
+def finalize_accepted(
+    req_to_host_pool: torch.Tensor,
+    device_mapping: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    host_locs: torch.Tensor,
+    accepted_locs: torch.Tensor,
+    device_locs: torch.Tensor,
+    newest_phys: torch.Tensor,
+    cumsum: torch.Tensor,
+    needs_move: torch.Tensor,
+    last_accepted_out: torch.Tensor,
+    newest_slot_out: torch.Tensor,
+) -> None:
+    module = _jit_hisparse_utils_module()
+    module.finalize_accepted(
+        req_to_host_pool,
+        device_mapping,
+        req_pool_indices,
+        seq_lens,
+        host_locs,
+        accepted_locs,
+        device_locs,
+        newest_phys,
+        cumsum,
+        needs_move,
+        last_accepted_out,
+        newest_slot_out,
     )

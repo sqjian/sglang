@@ -239,15 +239,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
+        # Isolate the buffer from outside addressing only after every needed
+        # allocation has succeeded.  The direct-to-host admission path relies on
+        # allocation failure being recoverable, so the mapping must remain
+        # unchanged on OOM.
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         # Filter valid (non-zero) hisparse indices.
         # In the direct-to-host path, mapping is all zeros since no hisparse
         # device indices were pre-allocated.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
+            self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
             self.free_hisparse_indices(hisparse_indices[need_size:])
         else:
             # page alignment, claiming the residual space for an incomplete page
@@ -266,13 +269,15 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                         ),
                     ]
                 )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
+            extra_size = need_size - len(hisparse_indices)
+            if extra_size > 0:
+                extra_indices = self.hisparse_attn_allocator.alloc(extra_size)
+                if extra_indices is None:
+                    return None
+                buffer_indices = torch.cat([hisparse_indices, extra_indices])
+            else:
+                buffer_indices = hisparse_indices
+            self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
@@ -285,6 +290,60 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         return self._kvcache._translate_loc_to_hisparse_device(last_locs)
+
+    def alloc_extend_with_device_mapping(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        device_slots: torch.Tensor,
+        backup_state: bool = False,
+    ):
+        """Allocate logical indices and map them to hisparse device slots atomically.
+
+        Combines logical allocation + device mapping into one call to prevent
+        callers from forgetting the mapping step (which causes silent corruption).
+        """
+        # Pre-flight capacity check to avoid launching a Triton kernel
+        # only to discover there aren't enough free pages.
+        avail = self.logical_attn_allocator.available_size()
+        if avail < extend_num_tokens:
+            raise RuntimeError(
+                f"HiSparse logical alloc: need {extend_num_tokens} tokens but only "
+                f"{avail} available"
+            )
+        logical_state = (
+            self.logical_attn_allocator.backup_state() if backup_state else None
+        )
+        out = self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        if out is None:
+            raise RuntimeError(
+                f"HiSparse logical alloc failed for {extend_num_tokens} tokens. "
+                f"Logical pool available: {self.logical_attn_allocator.available_size()}"
+            )
+        self.full_to_hisparse_device_index_mapping[out] = device_slots
+        if backup_state:
+            # Incremental backup: save only the allocated indices.
+            # On restore, these indices' mapping is reset to 0 (unallocated).
+            # This is O(extend_num_tokens) instead of O(total_pool_size).
+            return out, (logical_state, out.clone())
+        return out
+
+    def clear_device_mapping(self, logical_indices: torch.Tensor):
+        """Clear hisparse device mapping. Must be called before free() for
+        indices whose device slots were not allocated from hisparse_attn_allocator,
+        otherwise free_hisparse() would corrupt the hisparse allocator's free list."""
+        self.full_to_hisparse_device_index_mapping[logical_indices] = 0
 
     def alloc_extend(
         self,
@@ -383,6 +442,26 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+    def backup_state(self):
+        # Full backup - only used by callers that don't go through
+        # alloc_extend_with_device_mapping (which does incremental backup).
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        logical_state, mapping_info = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        if mapping_info.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            # Incremental restore from alloc_extend_with_device_mapping:
+            # mapping_info is the tensor of allocated indices whose mapping
+            # was 0 (unallocated) before the alloc. Reset them to 0.
+            self.full_to_hisparse_device_index_mapping[mapping_info] = 0
+        else:
+            # Full restore from backup_state()
+            self.full_to_hisparse_device_index_mapping.copy_(mapping_info)
 
 
 class DeepSeekV4SingleKVPoolHost:

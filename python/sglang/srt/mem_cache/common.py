@@ -271,8 +271,12 @@ def get_last_loc_kernel(
     req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
 
     token_mask = prefix_lens > 0
-    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
-    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
+    # Compute raw index: req_pool_indices * stride + (prefix_lens - 1)
+    # When prefix_lens=0, raw_index becomes negative/invalid
+    raw_token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    # Use safe index 0 when token_mask=False to prevent triton from pre-accessing invalid addresses
+    safe_token_index = tl.where(token_mask, raw_token_index, 0)
+    tokens = tl.load(req_to_token + safe_token_index, mask=token_mask, other=-1)
 
     tl.store(result + offset, tokens, mask=mask)
 

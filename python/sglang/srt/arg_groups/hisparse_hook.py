@@ -93,3 +93,26 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
                 f"--nsa-{label}-backend in {sorted(allowed_backends)}, "
                 f"but got {backend}."
             )
+
+    if server_args.speculative_algorithm is not None:
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        hisparse_cfg = parse_hisparse_config(server_args)
+        hisparse_page_size = hisparse_cfg.page_size or 64
+        max_draft = server_args.speculative_num_draft_tokens or 0
+        if max_draft >= hisparse_page_size:
+            raise ValueError(
+                f"hiSparse extra page capacity ({hisparse_page_size - 1} slots) "
+                f"is insufficient for speculative_num_draft_tokens={max_draft}. "
+                f"Reduce draft tokens or increase hiSparse page_size."
+            )
+        if (
+            server_args.speculative_eagle_topk is not None
+            and server_args.speculative_eagle_topk > 1
+            and server_args.page_size > 1
+        ):
+            raise ValueError(
+                "HiSparse + EAGLE topk > 1 + page_size > 1 is not yet supported: "
+                "move_kv_cache needs hisparse-aware loc translation. "
+                "Use speculative_eagle_topk=1 or page_size=1."
+            )
