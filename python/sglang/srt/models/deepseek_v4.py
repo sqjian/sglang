@@ -20,6 +20,7 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
@@ -78,6 +79,8 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+_FP8_WO_A_RECIPE = (1, 1, 128) if _FP8_WO_A_UE8M0 else (1, 128, 128)
 
 
 if TYPE_CHECKING:
@@ -297,7 +300,7 @@ class MQALayer(nn.Module):
             assert hasattr(
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
-            self.wo_a.weight_scale_inv.format_ue8m0 = True
+            self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -593,7 +596,7 @@ class MQALayer(nn.Module):
                 (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
-                recipe=(1, 1, 128),
+                recipe=_FP8_WO_A_RECIPE,
             )
             o = output
         else:
@@ -1105,12 +1108,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             R = attn.o_lora_rank
             D = attn.wo_a.weight.shape[1]
 
-            raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // 128, D // 128)
+            mn_block = 1 if _FP8_WO_A_UE8M0 else 128
+            raw_scale = attn.wo_a.weight_scale_inv.data.view(G, R // mn_block, D // 128)
             attn.wo_a.weight_scale_inv.data = transform_sf_into_required_layout(
                 raw_scale,
                 mn=R,
                 k=D,
-                recipe=(1, 128, 128),
+                recipe=_FP8_WO_A_RECIPE,
                 num_groups=G,
                 is_sfa=False,
             )
