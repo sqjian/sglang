@@ -909,6 +909,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
 
     @property
     def seqlen(self) -> int:
@@ -1266,6 +1267,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.hisparse_spec_info = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -2613,6 +2615,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
     def copy(self):
@@ -2852,3 +2855,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
