@@ -489,6 +489,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            hisparse_coordinator=batch.hisparse_coordinator,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device

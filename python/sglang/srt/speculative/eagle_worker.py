@@ -527,6 +527,7 @@ class EAGLEWorker(TpModelWorker):
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
                 else:
+                    self._clear_hisparse_pending_draft_extend_backup(batch)
                     # All reqs finished and dp_attention isn't forcing extend.
                     # Install an idle EagleDraftInput so next iter's scheduler
                     # ops (merge_batch / filter_batch) see well-typed empty
@@ -567,6 +568,22 @@ class EAGLEWorker(TpModelWorker):
         global_need_forward_cnt = global_need_forward[0].item()
         need_forward = global_need_forward_cnt > 0
         return need_forward
+
+    def _finish_hisparse_pending_draft_extend_backup(self, batch: ScheduleBatch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.finish_pending_draft_extend_backup()
+
+    def _clear_hisparse_pending_draft_extend_backup(self, batch: ScheduleBatch):
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            hisparse_coordinator.clear_pending_draft_extend_backup()
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -1199,6 +1216,7 @@ class EAGLEWorker(TpModelWorker):
             else CaptureHiddenMode.LAST
         )
         if draft_extend_input.input_ids.shape[0] == 0:
+            self._clear_hisparse_pending_draft_extend_backup(batch)
             # Single source for hidden_size via hidden_size_for(self) (incl.
             # EAGLE-3 aux widening). Two stub origins from verify(): fully-idle
             # batch (DP attn rank w/o reqs) and active batch with all reqs
@@ -1271,6 +1289,7 @@ class EAGLEWorker(TpModelWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             hidden_states = logits_output.hidden_states
 
+        self._finish_hisparse_pending_draft_extend_backup(batch)
         maybe_detect_nan(
             logits_output.next_token_logits,
             f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",
