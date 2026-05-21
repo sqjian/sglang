@@ -2185,6 +2185,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2196,11 +2197,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if self.release_req(idx, len(sorted_indices), server_args):
+                retracted_reqs.append(req)
+            else:
+                reqs_to_abort.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2235,13 +2237,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self, idx: int, remaing_req_count: int, server_args: ServerArgs
+    ) -> bool:
         req = self.reqs[idx]
+        should_retract = not isinstance(getattr(req, "to_finish", None), FINISH_ABORT)
 
         if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
+            if not should_retract:
+                self.hisparse_coordinator.request_finished(req)
+            else:
+                should_retract = self.hisparse_coordinator.retract_req(req)
+                if not should_retract:
+                    req.to_finish = FINISH_ABORT(
+                        "HiSparse preallocated host KV pool had no free slots while "
+                        "backing up the request for retract. Aborting this request "
+                        "instead of crashing the scheduler.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.hisparse_coordinator.request_finished(req)
 
-        if server_args.disaggregation_mode == "decode":
+        if (
+            server_args.disaggregation_mode == "decode"
+            and self.hisparse_coordinator is None
+        ):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
@@ -2251,7 +2270,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
-        req.reset_for_retract()
+        if should_retract:
+            req.reset_for_retract()
+        return should_retract
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
