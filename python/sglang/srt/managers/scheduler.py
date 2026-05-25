@@ -3359,6 +3359,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_bootstrap_queue.pending_queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -3640,32 +3641,109 @@ class Scheduler(
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Abort requests that are queued before KV sender admission.
+            remaining_pending = deque()
+            for req in self.disagg_prefill_bootstrap_queue.pending_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug(f"Abort pending bootstrap request. {req.rid=}")
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                else:
+                    remaining_pending.append(req)
+            self.disagg_prefill_bootstrap_queue.pending_queue = remaining_pending
+
             # Abort requests that have not yet been bootstrapped
+            remaining_bootstrap = []
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                else:
+                    remaining_bootstrap.append(req)
+            self.disagg_prefill_bootstrap_queue.queue = remaining_bootstrap
 
             # Abort in-flight requests
+            remaining_inflight = []
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    release_req_to_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                else:
+                    remaining_inflight.append(req)
+            self.disagg_prefill_inflight_queue = remaining_inflight
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
+            aborted_prealloc_rids = set()
+            remaining_prealloc = []
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if hasattr(decode_req.kv_receiver, "clear"):
+                        decode_req.kv_receiver.clear()
+                    aborted_prealloc_rids.add(decode_req.req.rid)
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(rid=decode_req.req.rid), decode_req.req
+                    )
+                else:
+                    remaining_prealloc.append(decode_req)
+            self.disagg_decode_prealloc_queue.queue = remaining_prealloc
+            if aborted_prealloc_rids:
+                self.disagg_decode_prealloc_queue.pending_reqs = [
+                    decode_req
+                    for decode_req in self.disagg_decode_prealloc_queue.pending_reqs
+                    if decode_req.req.rid not in aborted_prealloc_rids
+                ]
 
             # Abort requests waiting for kvcache to release tree cache
+            transfer_queue = self.disagg_decode_transfer_queue
+            remaining_transfer = []
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+                    if (
+                        transfer_queue.enable_staging
+                        and transfer_queue.staging_handler is not None
+                        and transfer_queue.staging_handler.is_staging_room(
+                            decode_req.req.bootstrap_room
+                        )
+                    ):
+                        transfer_queue.staging_handler.unregister_decode_req(
+                            decode_req.req.bootstrap_room
+                        )
+                    if decode_req.metadata_buffer_index != -1:
+                        transfer_queue.req_to_metadata_buffer_idx_allocator.free(
+                            decode_req.metadata_buffer_index
+                        )
+                        decode_req.metadata_buffer_index = -1
+                    if hasattr(decode_req.kv_receiver, "clear"):
+                        decode_req.kv_receiver.clear()
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(decode_req.req)
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(rid=decode_req.req.rid), decode_req.req
+                    )
+                else:
+                    remaining_transfer.append(decode_req)
+            self.disagg_decode_transfer_queue.queue = remaining_transfer
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
