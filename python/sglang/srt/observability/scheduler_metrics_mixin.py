@@ -1004,6 +1004,7 @@ class SchedulerMetricsMixin:
 
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.pending_queue)
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
@@ -1055,6 +1056,7 @@ class SchedulerMetricsMixin:
         disaggregation = None
         if include_all or "disagg" in include:
             mode_str = "null"
+            prefill_pending = 0
             prefill_bootstrap = 0
             prefill_inflight = 0
             decode_prealloc = 0
@@ -1063,6 +1065,7 @@ class SchedulerMetricsMixin:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
+                prefill_pending = len(self.disagg_prefill_bootstrap_queue.pending_queue)
                 prefill_bootstrap = len(self.disagg_prefill_bootstrap_queue.queue)
                 prefill_inflight = len(self.disagg_prefill_inflight_queue)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1075,6 +1078,7 @@ class SchedulerMetricsMixin:
 
             disaggregation = DisaggregationMetrics(
                 mode=mode_str,
+                prefill_pending_queue_reqs=prefill_pending,
                 prefill_bootstrap_queue_reqs=prefill_bootstrap,
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,
