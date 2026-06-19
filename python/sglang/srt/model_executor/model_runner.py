@@ -1014,7 +1014,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=get_global_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
@@ -1041,7 +1041,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=enable,
                 num_indexer_layers=num_indexer_layers,
                 index_topk=index_topk,
-                num_tokens=self.max_total_num_tokens + self.page_size,
+                num_tokens=self.max_token_pool_size + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
             )
