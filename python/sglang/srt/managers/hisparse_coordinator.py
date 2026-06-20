@@ -25,6 +25,7 @@ from sglang.jit_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -868,7 +869,89 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
             torch.int32
         ).unsqueeze(0)
-        return self.req_to_device_buffer[row_indices, col_indices]
+        device_slots = self.req_to_device_buffer[row_indices, col_indices]
+        if envs.SGLANG_HISPARSE_SPEC_DEBUG.get():
+            self._spec_debug_record_draft(
+                row_indices, col_indices, token_positions, device_slots
+            )
+        return device_slots
+
+    def _spec_debug_record_draft(
+        self,
+        row_indices: torch.Tensor,
+        col_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        device_slots: torch.Tensor,
+    ) -> None:
+        """Record draft-side (req, logical_token_pos) -> (device_col, device_slot)."""
+        rows = row_indices.detach().cpu().tolist()
+        cols = col_indices.detach().cpu().tolist()
+        positions = token_positions.detach().cpu().tolist()
+        slots = device_slots.detach().cpu().tolist()
+        self._spec_debug_draft_map = {}
+        per_req: dict = {}
+        for r, c, p, s in zip(rows, cols, positions, slots):
+            self._spec_debug_draft_map[(int(r), int(p))] = (int(c), int(s))
+            per_req.setdefault(int(r), []).append(int(p))
+        summary = {r: (min(ps), max(ps), len(ps)) for r, ps in per_req.items()}
+        logger.info(
+            "[hisparse-spec-debug] DRAFT write: per-req (pos_min,pos_max,count)=%s",
+            summary,
+        )
+
+    def _spec_debug_compare_verify(
+        self,
+        row_indices: torch.Tensor,
+        col_indices: torch.Tensor,
+        token_positions: torch.Tensor,
+        device_slots: torch.Tensor,
+    ) -> None:
+        """Compare verify-side mapping against the recorded draft-side mapping."""
+        draft_map = getattr(self, "_spec_debug_draft_map", None)
+        rows = row_indices.detach().cpu().tolist()
+        cols = col_indices.detach().cpu().tolist()
+        positions = token_positions.detach().cpu().tolist()
+        slots = device_slots.detach().cpu().tolist()
+        per_req: dict = {}
+        for r, p in zip(rows, positions):
+            per_req.setdefault(int(r), []).append(int(p))
+        summary = {r: (min(ps), max(ps), len(ps)) for r, ps in per_req.items()}
+        logger.info(
+            "[hisparse-spec-debug] VERIFY read: per-req (pos_min,pos_max,count)=%s",
+            summary,
+        )
+        if not draft_map:
+            logger.warning(
+                "[hisparse-spec-debug] no draft record to compare (draft_map empty)"
+            )
+            return
+        shared = 0
+        mismatch = 0
+        examples = []
+        for r, c, p, s in zip(rows, cols, positions, slots):
+            key = (int(r), int(p))
+            if key not in draft_map:
+                continue
+            shared += 1
+            draft_col, draft_slot = draft_map[key]
+            if draft_col != int(c) or draft_slot != int(s):
+                mismatch += 1
+                if len(examples) < 8:
+                    examples.append(
+                        f"req={r} pos={p}: draft(col={draft_col},slot={draft_slot}) "
+                        f"!= verify(col={c},slot={s})"
+                    )
+        logger.info(
+            "[hisparse-spec-debug] COMPARE: shared_positions=%d mismatched=%d%s",
+            shared,
+            mismatch,
+            (" examples=" + "; ".join(examples)) if examples else "",
+        )
+        if shared == 0:
+            logger.warning(
+                "[hisparse-spec-debug] draft and verify token positions DO NOT OVERLAP "
+                "at all -> draft KV columns are never the ones verify reads."
+            )
 
     def prepare_verify_slots_spec_v2(
         self,
@@ -916,6 +999,10 @@ class HiSparseCoordinator:
             start + pos_in_segment,
         )
         device_slots = self.req_to_device_buffer[row_indices, col_indices]
+        if envs.SGLANG_HISPARSE_SPEC_DEBUG.get():
+            self._spec_debug_compare_verify(
+                row_indices, col_indices, token_positions, device_slots
+            )
         self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
             torch.int32
         ).unsqueeze(0)

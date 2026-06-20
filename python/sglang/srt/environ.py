@@ -253,6 +253,8 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # HiSparse: compare draft-write vs verify-read device-slot mapping for spec decoding
+    SGLANG_HISPARSE_SPEC_DEBUG = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
