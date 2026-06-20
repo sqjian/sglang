@@ -1003,6 +1003,28 @@ class HiSparseCoordinator:
             self._spec_debug_compare_verify(
                 row_indices, col_indices, token_positions, device_slots
             )
+            # Direct, physical-slot-keyed check: what device column did the draft
+            # model's KV write map verify_cache_locs to, vs what verify now reads?
+            mapping = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+            prev = mapping[verify_cache_locs].detach().cpu().tolist()
+            new = device_slots.detach().cpu().tolist()
+            n = len(new)
+            n_mismatch = sum(1 for a, b in zip(prev, new) if int(a) != int(b))
+            n_prev_zero = sum(1 for a in prev if int(a) == 0)
+            ex = [
+                f"loc#{i}: draft_map={int(a)} verify_map={int(b)}"
+                for i, (a, b) in enumerate(zip(prev, new))
+                if int(a) != int(b)
+            ][:8]
+            logger.info(
+                "[hisparse-spec-debug] PHYS-SLOT cmp: n=%d mismatched=%d draft_map_zero=%d %s",
+                n,
+                n_mismatch,
+                n_prev_zero,
+                ("examples=" + "; ".join(ex)) if ex else "",
+            )
         self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
             torch.int32
         ).unsqueeze(0)
