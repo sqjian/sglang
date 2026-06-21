@@ -249,34 +249,13 @@ class EagleDraftWorkerBase(ABC):
                     page_size,
                 )
 
-            # HiSparse: the draft model reads/writes KV through the device-slot
-            # mapping (full_to_hisparse_device_index_mapping). Set it up for the
-            # draft tree tokens here, mirroring the verify path's
-            # prepare_verify_slots_spec_v2. Without this the draft attends to a
-            # stale/unset device mapping and produces low-quality drafts, which
-            # the target then rejects (acceptance-rate collapse). The contiguous
-            # out_cache_loc layout (page_size == 1 or topk == 1) lays out
-            # bs * (topk*num_steps) slots in req-major order at logical positions
-            # [seq_lens, seq_lens + topk*num_steps), matching get_draft_device_slots.
-            hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
-            if (
-                hisparse_coordinator is not None
-                and hisparse_coordinator.supports_hisparse_draft_slots()
-                and (page_size == 1 or topk == 1)
-            ):
-                seq_lens_cpu = (
-                    batch.seq_lens_cpu
-                    if batch.seq_lens_cpu is not None
-                    else batch.seq_lens.cpu()
-                )
-                device_slots = hisparse_coordinator.get_draft_device_slots(
-                    req_pool_indices=batch.req_pool_indices,
-                    num_tokens_per_req=topk * num_steps,
-                    start_positions_cpu=seq_lens_cpu,
-                )
-                hisparse_coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-                    batch.out_cache_loc
-                ] = device_slots
+            # NOTE: Under HiSparse the draft model runs on an independent DENSE KV
+            # pool (see ModelRunnerKVCacheMixin._draft_dense_over_hisparse), so it
+            # does NOT read through full_to_hisparse_device_index_mapping. The target
+            # verify window sets up its own tree-token device slots via
+            # HiSparseCoordinator.prepare_verify_slots_spec_v2, so no draft-side
+            # device-slot binding is needed here. (dsv4 HiSparse never reaches this
+            # path: supports_hisparse_draft_slots() is False for it.)
 
         # Get a forward batch
         draft_input.num_tokens_per_req = topk

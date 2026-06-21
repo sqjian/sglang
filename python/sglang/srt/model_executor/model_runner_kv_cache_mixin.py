@@ -298,6 +298,31 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
+        # Draft worker sharing a HiSparse allocator: decouple it from HiSparse.
+        #
+        # In EAGLE v2 the draft shares req_to_token_pool + token_to_kv_pool_allocator
+        # (one logical slot space) with the target, but keeps its own token_to_kv_pool
+        # tensors. Under HiSparse the draft's pool would be a HiSparseDSATokenToKVPool
+        # that reads through the device buffer (hot cache). That buffer is only
+        # maintained for *target* layers, so the draft's MTP layer reads stale/uninit
+        # KV for the prefix context -> bad drafts -> MTP accept-rate collapse (~0.13).
+        #
+        # Fix: give the draft a DENSE pool indexed directly by logical slot, sized to
+        # the shared allocator's full logical capacity (size_full). The draft then reads
+        # correct, fully-maintained KV. The shared req_to_token/allocator (slot space)
+        # is untouched, so the cache_loc/verify logic needs no changes. A dense
+        # DSATokenToKVPool has no translate_loc_to_hisparse_device method, so the
+        # draft forward path naturally skips the HiSparse device translation.
+        self._draft_dense_over_hisparse = (
+            self.is_draft_worker
+            and self.enable_hisparse
+            and isinstance(
+                self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+            )
+        )
+        if self._draft_dense_over_hisparse:
+            self.enable_hisparse = False
+
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             max_spec_draft_tokens = self.server_args.max_speculative_num_draft_tokens
@@ -569,8 +594,17 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            # Draft decoupled from HiSparse: the dense pool is indexed by the shared
+            # HiSparse allocator's logical slots, so it must span the full logical
+            # capacity (size_full = device_size * host_to_device_ratio), not the
+            # un-scaled device pool size.
+            dsa_pool_size = (
+                self.token_to_kv_pool_allocator.size_full
+                if self._draft_dense_over_hisparse
+                else self.max_total_num_tokens
+            )
             self.token_to_kv_pool = PoolCls(
-                self.max_total_num_tokens,
+                dsa_pool_size,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
