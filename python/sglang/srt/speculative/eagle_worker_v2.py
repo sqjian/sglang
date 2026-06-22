@@ -918,6 +918,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_backends(self):
         self._draft_worker.init_backends()
+        self._maybe_register_hisparse_draft_store()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -946,6 +947,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else self.server_args.cuda_graph_bs_decode
                     ),
                 )
+
+    def _maybe_register_hisparse_draft_store(self) -> None:
+        """Register the draft HiSparse store on the target coordinator.
+
+        Only when SGLANG_HISPARSE_DRAFT_SPARSE is on and the draft kept its own
+        HiSparse pool (sparse-draft mode). No-op otherwise.
+        """
+        if not envs.SGLANG_HISPARSE_DRAFT_SPARSE.get():
+            return
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+
+        coordinator = getattr(
+            self._target_worker.model_runner, "hisparse_coordinator", None
+        )
+        if coordinator is None:
+            logger.warning(
+                "SGLANG_HISPARSE_DRAFT_SPARSE set but target HiSparse coordinator "
+                "is missing; draft store not registered."
+            )
+            return
+        draft_pool = self._draft_worker.draft_runner.token_to_kv_pool
+        if not isinstance(draft_pool, HiSparseDSATokenToKVPool):
+            logger.warning(
+                "SGLANG_HISPARSE_DRAFT_SPARSE set but draft pool is %s, not a "
+                "HiSparseDSATokenToKVPool; draft store not registered.",
+                type(draft_pool).__name__,
+            )
+            return
+        coordinator.register_draft_store(draft_pool)
 
     @property
     def target_worker(self):

@@ -1513,6 +1513,7 @@ class DeepseekSparseAttnBackend(
                     layer.layer_id,
                     token_position_space="full",
                     num_steps=num_steps,
+                    mem_pool_device=self.token_to_kv_pool,
                 ).view(num_reqs * num_steps, -1)
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 assert (
@@ -1701,6 +1702,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
                 token_position_space="full",
+                mem_pool_device=self.token_to_kv_pool,
             )
         elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
@@ -2312,6 +2314,7 @@ class DeepseekSparseAttnBackend(
             layer_id,
             token_position_space="full",
             num_steps=max_steps,
+            mem_pool_device=self.token_to_kv_pool,
         )
 
         rows = [

@@ -37,6 +37,67 @@ class HiSparseAct(NamedTuple):
     req: Req
 
 
+class HiSparseDraftStore:
+    """Independent HiSparse KV store for the draft/MTP layers.
+
+    The draft model shares the logical slot space (allocator + req_to_token_pool)
+    with the target, but its KV values, host backup, and per-layer device-buffer
+    residency state are independent (different layers/weights). This holder owns
+    those draft-side parallels so the coordinator can drive swap-in / staging /
+    backup on the draft store in lockstep with the target store. See
+    docs_draft_hisparse_design.md.
+    """
+
+    def __init__(
+        self,
+        mem_pool_device,
+        mem_pool_host,
+        layer_num: int,
+        max_num_req_slots: int,
+        padded_buffer_size: int,
+        device_buffer_size: int,
+        max_compressed_context_len: int,
+        page_size: int,
+        item_size_bytes: int,
+        device: str,
+    ):
+        self.mem_pool_device = mem_pool_device
+        self.mem_pool_host = mem_pool_host
+        self.layer_num = layer_num
+        self.item_size_bytes = item_size_bytes
+
+        # Per-(layer, req, slot) residency state, sized to the DRAFT layer count.
+        self.req_device_buffer_tokens = torch.full(
+            (layer_num, max_num_req_slots, padded_buffer_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.req_device_buffer_token_locs = torch.full(
+            (layer_num, max_num_req_slots, padded_buffer_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        _lru_init = torch.arange(device_buffer_size, dtype=torch.int16, device=device)
+        self.lru_slots = (
+            _lru_init.view(1, 1, -1)
+            .repeat(layer_num, max_num_req_slots, 1)
+            .contiguous()
+        )
+
+        # Independent host-slot bookkeeping for the draft store.
+        self.req_to_host_pool = torch.full(
+            (max_num_req_slots, max_compressed_context_len + page_size),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.req_to_host_pool_allocated_len = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+
+
 class HiSparseTokenStats(NamedTuple):
     device_tokens: int
     device_token_usage: float
@@ -113,6 +174,11 @@ class HiSparseCoordinator:
         max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
         ) // self.compress_ratio
+        # Cached for register_draft_store (the draft store mirrors these dims).
+        self.max_num_req_slots = max_num_req_slots
+        self.max_compressed_context_len = max_compressed_context_len
+        self.host_to_device_ratio = host_to_device_ratio
+        self.host_allocator_type = host_allocator_type
 
         # to have an extra page for new tokens
         self.padded_buffer_size = (
@@ -188,6 +254,54 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
         self._pending_draft_extend_backup = None
+
+        # Optional draft/MTP HiSparse store (set by register_draft_store when
+        # SGLANG_HISPARSE_DRAFT_SPARSE is enabled).
+        self._draft_store: Union[HiSparseDraftStore, None] = None
+
+    def register_draft_store(self, draft_mem_pool_device) -> None:
+        """Build an independent HiSparse store for the draft/MTP layers.
+
+        Called once after the draft model_runner has created its HiSparse pool.
+        The draft store shares the logical slot space (allocator/req_to_token)
+        but keeps its own KV pool, host pool, and per-layer device-buffer state,
+        so the coordinator can drive swap-in/staging/backup on it in lockstep.
+        """
+        if self._draft_store is not None:
+            logger.warning("HiSparse draft store already registered; ignoring.")
+            return
+        if self.is_dsv4_hisparse:
+            raise NotImplementedError(
+                "HiSparse sparse-draft store is not yet supported for DeepSeek V4 "
+                "(compressed) HiSparse."
+            )
+
+        draft_mem_pool_host = MLATokenToKVPoolHost(
+            device_pool=draft_mem_pool_device,
+            host_to_device_ratio=self.host_to_device_ratio,
+            host_size=0,
+            page_size=draft_mem_pool_device.page_size,
+            layout="layer_first",
+            allocator_type=self.host_allocator_type,
+            override_kv_cache_dim=draft_mem_pool_device.kv_cache_dim,
+        )
+        self._draft_store = HiSparseDraftStore(
+            mem_pool_device=draft_mem_pool_device,
+            mem_pool_host=draft_mem_pool_host,
+            layer_num=draft_mem_pool_device.layer_num,
+            max_num_req_slots=self.max_num_req_slots,
+            padded_buffer_size=self.padded_buffer_size,
+            device_buffer_size=self.device_buffer_size,
+            max_compressed_context_len=self.max_compressed_context_len,
+            page_size=self.page_size,
+            item_size_bytes=draft_mem_pool_host.token_stride_size,
+            device=self.device,
+        )
+        logger.info(
+            "HiSparse draft store registered: draft layer_num=%d, host slots=%d",
+            self._draft_store.layer_num,
+            draft_mem_pool_host.size,
+        )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -1588,6 +1702,7 @@ class HiSparseCoordinator:
         layer_id: int,
         token_position_space: Literal["compressed", "full"] = "compressed",
         num_steps: int = 1,
+        mem_pool_device=None,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices.
 
@@ -1595,7 +1710,40 @@ class HiSparseCoordinator:
             seq_lens shape: [num_reqs * num_steps] flat req-major
             top_k_result shape: [num_reqs, num_steps, top_k]
             returns: [num_reqs, num_steps, top_k]
+
+        `mem_pool_device` is the caller's own KV pool. When it matches the
+        registered draft store's pool, the swap routes to the DRAFT store
+        (draft device/host buffers + per-layer state); otherwise the target
+        store is used. This keeps draft and target residency independent.
         """
+        # Resolve which store (target vs draft) this swap belongs to.
+        use_draft = (
+            self._draft_store is not None
+            and mem_pool_device is not None
+            and mem_pool_device is self._draft_store.mem_pool_device
+        )
+        if use_draft:
+            store = self._draft_store
+            store_device = store.mem_pool_device
+            store_host = store.mem_pool_host
+            store_buffer_tokens = store.req_device_buffer_tokens
+            store_buffer_locs = store.req_device_buffer_token_locs
+            store_lru = store.lru_slots
+            store_req_to_host = store.req_to_host_pool
+            store_item_size = store.item_size_bytes
+        else:
+            store_device = self.mem_pool_device
+            store_host = self.mem_pool_host
+            store_buffer_tokens = self.req_device_buffer_tokens
+            store_buffer_locs = self.req_device_buffer_token_locs
+            store_lru = self.lru_slots
+            store_req_to_host = self.req_to_host_pool
+            store_item_size = self.item_size_bytes
+        # Per-layer arrays / kv buffers are indexed by the pool-local layer id.
+        # Target pools start at layer 0 (no change); the draft pool starts at
+        # its MTP layer id, so subtract start_layer to land at local index 0.
+        local_layer_id = layer_id - store_device.start_layer
+
         num_reqs = req_pool_indices.size(0)
         needed = num_reqs * num_steps
 
@@ -1653,19 +1801,19 @@ class HiSparseCoordinator:
         )
         swap_in_fn(
             top_k_tokens=swap_top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer_tokens=store_buffer_tokens[local_layer_id],
+            host_cache_locs=store_req_to_host,
+            device_buffer_locs=store_buffer_locs[local_layer_id],
+            host_cache=store_host.kv_buffer[local_layer_id],
+            device_buffer=store_device.kv_buffer[local_layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=swap_seq_lens,
-            lru_slots=self.lru_slots[layer_id],
-            item_size_bytes=self.item_size_bytes,
+            lru_slots=store_lru[local_layer_id],
+            item_size_bytes=store_item_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
-            page_size=self.mem_pool_device.page_size if num_steps > 1 else 1,
+            page_size=store_device.page_size if num_steps > 1 else 1,
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
             num_steps=num_steps,

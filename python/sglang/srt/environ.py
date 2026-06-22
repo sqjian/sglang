@@ -255,6 +255,11 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     # HiSparse: compare draft-write vs verify-read device-slot mapping for spec decoding
     SGLANG_HISPARSE_SPEC_DEBUG = EnvBool(False)
+    # HiSparse spec decoding: when True, the draft/MTP worker attends through its
+    # own HiSparse sparse-attention store (matching the target's sparse context)
+    # instead of the default dense-over-HiSparse workaround. See
+    # docs_draft_hisparse_design.md.
+    SGLANG_HISPARSE_DRAFT_SPARSE = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)

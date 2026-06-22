@@ -313,12 +313,17 @@ class ModelRunnerKVCacheMixin:
         # is untouched, so the cache_loc/verify logic needs no changes. A dense
         # DSATokenToKVPool has no translate_loc_to_hisparse_device method, so the
         # draft forward path naturally skips the HiSparse device translation.
+        # Default: dense-over-HiSparse workaround (draft gets an independent dense
+        # pool). When SGLANG_HISPARSE_DRAFT_SPARSE is set, keep the draft on its
+        # own HiSparse sparse-attention store instead, so it sees the same sparse
+        # context the target verifies with. See docs_draft_hisparse_design.md.
         self._draft_dense_over_hisparse = (
             self.is_draft_worker
             and self.enable_hisparse
             and isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
+            and not envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
         )
         if self._draft_dense_over_hisparse:
             self.enable_hisparse = False
