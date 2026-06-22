@@ -1077,6 +1077,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            # Drain the deferred accepted-token host backup that
+            # finalize_accepted_tokens() queued during verify. It is deferred to
+            # here because the newest-token slot KV is only final once
+            # draft-extend has run; without this drain the backup is silently
+            # discarded by the next verify's clear_pending_draft_extend_backup(),
+            # so swap-in later reloads stale host KV (HiSparse sparse-draft
+            # acceptance collapse).
+            hisparse_coordinator = batch.hisparse_coordinator
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+                and not batch.forward_mode.is_idle()
+            ):
+                hisparse_coordinator.finish_pending_draft_extend_backup()
+
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
