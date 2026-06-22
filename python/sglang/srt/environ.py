@@ -260,6 +260,11 @@ class Envs:
     # instead of the default dense-over-HiSparse workaround. See
     # docs_draft_hisparse_design.md.
     SGLANG_HISPARSE_DRAFT_SPARSE = EnvBool(False)
+    # HiSparse sparse-draft debug: log the L2 norm of the draft hot-buffer KV at
+    # the slots the draft swap-in returns, vs the target pool KV at the same
+    # physical slots. Confirms whether the draft pool actually holds (nonzero)
+    # draft KV where the draft DSA attention reads. See docs_draft_hisparse_design.md.
+    SGLANG_HISPARSE_DRAFT_KV_DEBUG = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)

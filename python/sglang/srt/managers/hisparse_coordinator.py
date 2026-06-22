@@ -1966,4 +1966,52 @@ class HiSparseCoordinator:
             num_real_reqs=self.num_real_reqs,
             num_steps=num_steps,
         )
+        if use_draft and envs.SGLANG_HISPARSE_DRAFT_KV_DEBUG.get():
+            self._draft_kv_debug(top_k_indices, store_device, local_layer_id, layer_id)
         return top_k_indices
+
+    def _draft_kv_debug(
+        self,
+        top_k_indices: torch.Tensor,
+        store_device,
+        local_layer_id: int,
+        layer_id: int,
+    ) -> None:
+        """Log whether the draft hot-buffer KV the swap-in returns is nonzero.
+
+        If the draft pool's KV at the returned slots is ~0, the draft KV was
+        never written there (write-path bug). If it is nonzero, the draft holds
+        valid KV and the bug is elsewhere (selection/mask/position/layer id).
+        """
+        try:
+            slots = top_k_indices.detach().reshape(-1)
+            valid = slots[slots >= 0].to(torch.int64)
+            n = int(valid.numel())
+            if n == 0:
+                logger.info(
+                    "[hisparse-draft-kv] layer=%d local=%d: no valid slots",
+                    layer_id,
+                    local_layer_id,
+                )
+                return
+            draft_buf = store_device.kv_buffer[local_layer_id]
+            draft_rows = draft_buf[valid].float()
+            per_slot_norm = draft_rows.flatten(1).norm(dim=1)
+            zero_frac = float((per_slot_norm == 0).float().mean().item())
+            # Same physical slots in the TARGET pool (different layer set, used
+            # only as a "these slots are populated somewhere" sanity baseline).
+            tgt_buf = self.mem_pool_device.kv_buffer[0]
+            tgt_norm = tgt_buf[valid].float().flatten(1).norm(dim=1)
+            logger.info(
+                "[hisparse-draft-kv] layer=%d local=%d n=%d draft_norm(mean=%.4f "
+                "min=%.4f) zero_frac=%.3f tgt_norm(mean=%.4f)",
+                layer_id,
+                local_layer_id,
+                n,
+                float(per_slot_norm.mean().item()),
+                float(per_slot_norm.min().item()),
+                zero_frac,
+                float(tgt_norm.mean().item()),
+            )
+        except Exception as e:  # debug-only: never break the forward
+            logger.warning("[hisparse-draft-kv] debug failed: %s", e)
