@@ -87,10 +87,10 @@ the target arrays with the draft layer id.
    `HiSparseCoordinator.register_draft_store(draft_pool)`, called from
    `EagleWorkerV2._maybe_register_hisparse_draft_store()` after draft backends
    init. DSV4-compressed HiSparse raises NotImplementedError for now.
-3. **[TODO]** Route `swap_in_selected_pages` to the draft store for draft-layer
+3. **[DONE]** Route `swap_in_selected_pages` to the draft store for draft-layer
    forwards (add a `store` selector; the draft attention calls swap-in with its
    own layer id -> draft buffers/pools).
-4. **[TODO]** Mirror prefill staging + decode backup + newest-slot remap to the
+4. **[DONE]** Mirror prefill staging + decode backup + newest-slot remap to the
    draft store (draft prefill KV -> draft host; accepted draft KV -> draft host).
 5. **[TODO]** Validate on GPU: with the flag on, PHYS-SLOT debug shows
    draft/verify agree, `full_to_hisparse_device_index_mapping[attended] != 0`
@@ -98,45 +98,44 @@ the target arrays with the draft layer id.
 
 ### Status
 
-- Steps 1-3 implemented and compile-clean (no GPU validation yet).
+- Steps 1-4 implemented and compile-clean (no GPU validation yet).
   - Step 3: `swap_in_selected_pages` now takes `mem_pool_device=` and routes to
     `self._draft_store` (with a pool-local layer id) when the caller's pool is
     the draft pool. All `dsa_backend` call sites pass
     `mem_pool_device=self.token_to_kv_pool`.
+  - Step 4: all coordinator data-movement points now mirror to `_draft_store`
+    when it is registered (see "Design fork resolved" below).
 
-### OPEN DESIGN FORK (must resolve before Step 4)
+### Design fork resolved: option B (shared slot bookkeeping)
 
-The draft pool currently **shares** `full_to_hisparse_device_index_mapping`
-with the target (mixin `model_runner_kv_cache_mixin.py:875-877`). For sparse
-attention this is inconsistent:
+We chose the **shared-mapping** variant. The draft pool shares the target's
+`full_to_hisparse_device_index_mapping`, the physical device-slot allocation
+(`req_to_device_buffer`, `req_device_buffer_size`), and the host-slot
+allocation (`req_to_host_pool`). Only the KV **byte stores**
+(`mem_pool_device` / `mem_pool_host`) and the per-(layer, req, slot) swap-in
+**residency state** (`req_device_buffer_tokens`, `req_device_buffer_token_locs`,
+`lru_slots`) are draft-specific. `register_draft_store` asserts the draft pool's
+mapping IS the allocator's shared tensor, so `set_mla_kv_buffer(loc)` translates
+draft writes to the SAME physical slot the target uses. Read and write therefore
+land on the same slot; the residency state diverges only because each store
+loads its own top-k into the hot buffer.
 
-- READ path: the draft's `swap_in_selected_pages` returns device slots from the
-  draft store's *own* per-layer residency (independent LRU/buffers). The draft
-  does NOT read through the shared mapping.
-- WRITE path: the draft pool's `set_mla_kv_buffer(loc)` translates `loc` via the
-  *shared* mapping to a device slot — i.e. the TARGET's slot decision.
+### Step 4 (DONE) — coordinator mirror points
 
-So the draft would write its KV to a target-decided slot but read from a
-draft-decided slot -> mismatch. Two options:
+All implemented in `hisparse_coordinator.py`, each gated on
+`self._draft_store is not None`:
 
-1. **Independent draft mapping** (preferred): give the draft pool its own
-   `full_to_hisparse_device_index_mapping` and its own slot bookkeeping (finalize
-   / prepare_verify / staging all maintain a draft copy). Fully decouples draft
-   residency from target. More code, but correct and self-consistent.
-2. **Slot-aligned stores**: force the draft store's swap-in/residency to mirror
-   the target's slot assignment exactly (same LRU, same selection), so a shared
-   mapping is valid. Simpler bookkeeping but couples the two and assumes the
-   draft top-k == target top-k (not generally true).
-
-Recommendation: option 1. This also means Step 4 (staging/backup/finalize)
-maintains a draft-side copy of the mapping + req_to_host_pool in lockstep.
-
-### Step 4 (blocked on the fork)
-
-- Mirror prefill staging: draft prefill KV -> draft host pool.
-- Mirror decode backup + newest-slot remap to the draft store + draft mapping.
-- Mirror `prepare_verify_slots_spec_v2` / `finalize_accepted_tokens` to update
-  the draft mapping (option 1).
+- **KV-byte movement** (same shared host/device slots): `admit_request_into_staging`
+  (prefill stage), `_eager_backup_previous_token` + `_backup_device_locs_to_host`
+  (decode backup), `_preload_to_device_buffer` (direct-admit preload),
+  `finalize_accepted_tokens` (`transfer_values_on_device` newest-slot move).
+- **Per-layer occupancy baseline**: `alloc_device_buffer`, `_grow_device_buffers`,
+  `_ensure_padded_buffer`, `admit_request_direct` (empty-buffer reset),
+  `map_last_loc_to_buffer` + `finalize_accepted_tokens` (newest-token slot),
+  `get_draft_device_slots` / `get_draft_device_slots_variable` (draft-proposal
+  extra-page residency).
+- `prepare_verify_slots_spec_v2` is target-verify-only (the draft does not run
+  during verify) and is intentionally NOT mirrored.
 
 ## Open questions
 
