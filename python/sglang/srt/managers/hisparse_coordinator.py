@@ -886,6 +886,27 @@ class HiSparseCoordinator:
             return
         self._pending_draft_extend_backup = None
         host_locs, device_locs, logical_locs_to_clear = pending
+        if (
+            self._draft_store is not None
+            and device_locs.numel() > 0
+            and envs.SGLANG_HISPARSE_DRAFT_KV_DEBUG.get()
+        ):
+            # Deferred-backup staleness check: draft KV for accepted tokens must
+            # be resident at these slots NOW (after draft_extend). A nonzero
+            # zero_frac here means the draft never wrote those slots -> swap-in
+            # later reloads stale host KV (a residual acceptance cap).
+            d = self._draft_store.mem_pool_device.kv_buffer[0][
+                device_locs.long()
+            ].float()
+            d_norm = d.flatten(1).norm(dim=1)
+            logger.info(
+                "[hisparse-deferred-backup] n=%d draft_norm(mean=%.4f min=%.4f) "
+                "zero_frac=%.3f",
+                int(device_locs.numel()),
+                float(d_norm.mean().item()),
+                float(d_norm.min().item()),
+                float((d_norm == 0).float().mean().item()),
+            )
         self._backup_device_locs_to_host(host_locs, device_locs)
         if logical_locs_to_clear.numel() > 0:
             full_to_device_mapping = (
@@ -1891,6 +1912,21 @@ class HiSparseCoordinator:
         # Target pools start at layer 0 (no change); the draft pool starts at
         # its MTP layer id, so subtract start_layer to land at local index 0.
         local_layer_id = layer_id - store_device.start_layer
+
+        if self._draft_store is not None and envs.SGLANG_HISPARSE_DRAFT_KV_DEBUG.get():
+            # Confirm draft-proposal swaps route to the draft branch (use_draft
+            # True, local_layer_id 0, draft-shaped [1, ...] state). A draft
+            # forward that logs use_draft=False would silently read target state.
+            logger.info(
+                "[hisparse-swap-route] use_draft=%s layer=%d start=%d local=%d "
+                "buf_shape=%s lru_shape=%s",
+                use_draft,
+                layer_id,
+                int(store_device.start_layer),
+                int(local_layer_id),
+                tuple(store_buffer_tokens.shape),
+                tuple(store_lru.shape),
+            )
 
         num_reqs = req_pool_indices.size(0)
         needed = num_reqs * num_steps
