@@ -1078,8 +1078,6 @@ class HiSparseCoordinator:
         )
         in_hot_buffer = accepted_token_positions < self.device_buffer_size
 
-        # Snapshot mapping values before mutation for rollback.
-        draft_mapping_snapshot = full_to_device_mapping[draft_cache_locs].clone()
         accepted_device_locs = full_to_device_mapping[accepted_cache_locs].clone()
 
         full_to_device_mapping[draft_cache_locs] = 0
@@ -1098,15 +1096,38 @@ class HiSparseCoordinator:
             backup_req_indices = accepted_req_indices[needs_backup]
             backup_device_locs = accepted_device_locs[needs_backup]
 
-            host_locs = self.mem_pool_host.alloc(backup_count)
-            if host_locs is None:
-                full_to_device_mapping[draft_cache_locs] = draft_mapping_snapshot
-                logger.error(
-                    "HiSparse: host alloc failed for %d accepted draft tokens, rolled back",
-                    backup_count,
+            # Allocate host slots per request, page-aligned, keyed by token
+            # position (mirrors the non-spec decode backup path). A flat
+            # alloc(backup_count) is invalid when the host pool page_size > 1
+            # (backup_count is an arbitrary accepted-token count, not a multiple
+            # of the page size) and ignores per-request position layout.
+            # Accepted positions are contiguous and ascending within a request,
+            # and accepted_req_indices groups them by request, so each request's
+            # backup positions form a single contiguous run.
+            backup_req_indices_cpu = backup_req_indices.tolist()
+            backup_positions_cpu = backup_positions.tolist()
+            host_locs_list = []
+            run_start = 0
+            n_backup = len(backup_req_indices_cpu)
+            while run_start < n_backup:
+                run_end = run_start + 1
+                while (
+                    run_end < n_backup
+                    and backup_req_indices_cpu[run_end]
+                    == backup_req_indices_cpu[run_start]
+                ):
+                    run_end += 1
+                host_locs_list.append(
+                    self.mem_pool_host.alloc_paged_token_slots(
+                        self.req_to_host_pool,
+                        self.req_to_host_pool_allocated_len,
+                        backup_req_indices_cpu[run_start],
+                        backup_positions_cpu[run_start],
+                        run_end - run_start,
+                    )
                 )
-                return
-            host_locs = host_locs.to(device=self.device)
+                run_start = run_end
+            host_locs = torch.cat(host_locs_list).to(device=self.device)
 
             self._backup_device_locs_to_host(host_locs, backup_device_locs)
             self.req_to_host_pool[backup_req_indices, backup_positions] = host_locs
@@ -1481,17 +1502,44 @@ class HiSparseCoordinator:
             )
             return False
 
-        new_host_indices = self.mem_pool_host.alloc(missing_positions.numel())
-        if new_host_indices is None:
+        # Allocate host slots per request, page-aligned, keyed by token position
+        # (mirrors the non-spec decode backup path). A flat alloc(numel) is
+        # invalid when the host pool page_size > 1 (numel is an arbitrary token
+        # count, not a multiple of the page size) and ignores per-request
+        # position layout. Decode backs up whole pages from position 0, and
+        # req_to_host_pool is -1 beyond allocated_len, so the missing positions
+        # are always the single contiguous suffix [allocated_len, host_len).
+        missing_positions_cpu = missing_positions.tolist()
+        start_pos = missing_positions_cpu[0]
+        num_missing = len(missing_positions_cpu)
+        assert missing_positions_cpu[-1] == start_pos + num_missing - 1, (
+            f"HiSparse retract expects contiguous missing host positions for "
+            f"req {req.rid}, got {missing_positions_cpu}"
+        )
+        # Insufficient host pages would make alloc_paged_token_slots raise
+        # mid-mutation; check first so retract fails gracefully (return False)
+        # without leaving partially-allocated, un-backed-up host slots.
+        allocated_len = int(self.req_to_host_pool_allocated_len[req.req_pool_idx])
+        page_end = self.mem_pool_host._round_up_to_page_size(start_pos + num_missing)
+        num_new_pages = max(0, (page_end - allocated_len) // self.mem_pool_host.page_size)
+        if num_new_pages * self.mem_pool_host.page_size > (
+            self.mem_pool_host.available_size()
+        ):
             logger.warning(
                 "HiSparse cannot retract req %s: host mem pool alloc failed for "
                 "%d backup tokens, available=%d",
                 req.rid,
-                missing_positions.numel(),
+                num_missing,
                 self.mem_pool_host.available_size(),
             )
             return False
-        new_host_indices = new_host_indices.to(device=self.device)
+        new_host_indices = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            start_pos,
+            num_missing,
+        ).to(device=self.device)
         self._backup_device_locs_to_host(new_host_indices, device_locs)
         self.req_to_host_pool[req.req_pool_idx, missing_positions] = new_host_indices
         return True
