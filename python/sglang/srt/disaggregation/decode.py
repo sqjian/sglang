@@ -410,8 +410,50 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
         kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
         # HiSparse direct-to-host uses host-pool indices for target KV transfer.
-        # Draft KV remains device-indexed and cannot share that destination list.
+        # Sparse-draft mode has its own draft host pool with the same host slot
+        # numbers, so it can be transferred alongside target KV. Dense-over-
+        # HiSparse keeps the historical behavior and does not append draft KV.
         if (
+            self.draft_token_to_kv_pool is not None
+            and self.scheduler.enable_hisparse
+            and envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+        ):
+            if self.transfer_backend == TransferBackend.MOONCAKE:
+                logger.warning(
+                    "SGLANG_HISPARSE_DRAFT_SPARSE is set, but Mooncake "
+                    "HiSparse send_kvcache_hisparse transfers only target KV; "
+                    "skipping draft direct transfer registration."
+                )
+            else:
+                coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+                draft_host_pool = (
+                    coordinator.get_draft_transfer_host_pool(
+                        self.draft_token_to_kv_pool
+                    )
+                    if coordinator is not None
+                    else None
+                )
+                if draft_host_pool is not None:
+                    draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                        draft_host_pool.get_contiguous_buf_infos()
+                    )
+                    kv_data_ptrs += draft_kv_data_ptrs
+                    kv_data_lens += draft_kv_data_lens
+                    kv_item_lens += draft_kv_item_lens
+                    coordinator.enable_direct_draft_transfer()
+                    logger.info(
+                        "HiSparse sparse-draft direct transfer registered: "
+                        "target_ptrs=%d draft_ptrs=%d",
+                        kv_args.target_kv_data_ptr_count,
+                        len(draft_kv_data_ptrs),
+                    )
+                else:
+                    logger.warning(
+                        "SGLANG_HISPARSE_DRAFT_SPARSE is set, but no matching "
+                        "HiSparse draft host pool is registered; direct prefill "
+                        "draft KV will not be transferred."
+                    )
+        elif (
             self.draft_token_to_kv_pool is not None
             and not self.scheduler.enable_hisparse
         ):

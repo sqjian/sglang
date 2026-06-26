@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -108,6 +108,74 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
+def _debug_tensor_values(tensor: Optional[torch.Tensor], limit: int = 16) -> List[int]:
+    if tensor is None or tensor.numel() == 0:
+        return []
+    return [
+        int(x)
+        for x in tensor.detach().flatten()[:limit].to(dtype=torch.int64).cpu().tolist()
+    ]
+
+
+def _log_hisparse_accept_debug(
+    *,
+    compacted: bool,
+    accept_lens: torch.Tensor,
+    input_rows: int,
+    select_index: torch.Tensor,
+    next_top1: torch.Tensor,
+) -> None:
+    if not envs.SGLANG_HISPARSE_SPEC_DEBUG.get():
+        return
+    try:
+        accept_cpu = accept_lens.detach().to(dtype=torch.int64).cpu()
+        if accept_cpu.numel() == 0:
+            accept_hist = []
+            accept_min = accept_max = 0
+            accept_mean = 0.0
+        else:
+            accept_hist = [
+                int(x)
+                for x in torch.bincount(
+                    accept_cpu, minlength=int(accept_cpu.max().item()) + 1
+                ).tolist()
+            ]
+            accept_min = int(accept_cpu.min().item())
+            accept_max = int(accept_cpu.max().item())
+            accept_mean = float(accept_cpu.float().mean().item())
+        logger.info(
+            "[hisparse-accept-debug] compacted=%s bs=%d input_rows=%d "
+            "accept_min=%d accept_max=%d accept_mean=%.2f accept_hist=%s "
+            "select_index_head=%s next_top1_head=%s",
+            compacted,
+            int(accept_lens.numel()),
+            input_rows,
+            accept_min,
+            accept_max,
+            accept_mean,
+            accept_hist,
+            _debug_tensor_values(select_index),
+            _debug_tensor_values(next_top1),
+        )
+    except Exception as e:
+        logger.warning("[hisparse-accept-debug] failed: %s", e)
+
+
+def _should_share_mtp_topk_indices(
+    *,
+    config_enabled: bool,
+    topk: int,
+    server_args: ServerArgs,
+    draft_uses_hisparse_mapping: Optional[bool] = None,
+) -> bool:
+    if draft_uses_hisparse_mapping is None:
+        draft_uses_hisparse_mapping = getattr(server_args, "enable_hisparse", False)
+    sparse_hisparse_draft = (
+        draft_uses_hisparse_mapping and envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+    )
+    return bool(config_enabled and topk == 1 and not sparse_hisparse_draft)
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -190,13 +258,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
         # Reuse the first draft step's NSA/DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
-        self.index_share_for_mtp_iteration = (
-            getattr(
-                self.draft_runner.model_config.hf_config,
-                "index_share_for_mtp_iteration",
-                False,
-            )
-            and self.topk == 1
+        config_index_share_for_mtp_iteration = getattr(
+            self.draft_runner.model_config.hf_config,
+            "index_share_for_mtp_iteration",
+            False,
+        )
+        self.config_index_share_for_mtp_iteration = config_index_share_for_mtp_iteration
+        self.index_share_for_mtp_iteration = _should_share_mtp_topk_indices(
+            config_enabled=config_index_share_for_mtp_iteration,
+            topk=self.topk,
+            server_args=server_args,
         )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -219,15 +290,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        draft_uses_hisparse_mapping = hasattr(
+            self.draft_runner.token_to_kv_pool,
+            "translate_loc_to_hisparse_device",
+        )
+        self.index_share_for_mtp_iteration = _should_share_mtp_topk_indices(
+            config_enabled=self.config_index_share_for_mtp_iteration,
+            topk=self.topk,
+            server_args=self.server_args,
+            draft_uses_hisparse_mapping=draft_uses_hisparse_mapping,
+        )
+        if (
+            self.config_index_share_for_mtp_iteration
+            and self.topk == 1
+            and not self.index_share_for_mtp_iteration
+            and draft_uses_hisparse_mapping
+            and envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+        ):
+            logger.info(
+                "HiSparse sparse draft disables index_share_for_mtp_iteration; "
+                "each MTP step will recompute DSA top-k for the draft KV store."
+            )
         self.init_token_map()
         self.init_lm_head()
 
-    def init_backends(self):
+    def init_backends(self, pre_cuda_graph_hook: Optional[Callable[[], None]] = None):
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.draft_worker.init_backends(disable_cuda_graph=True)
             self.init_attention_backend()
+            if pre_cuda_graph_hook is not None:
+                pre_cuda_graph_hook()
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self.init_cuda_graphs()
@@ -758,6 +852,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
             )
+            select_index = getattr(
+                forward_batch, "hisparse_draft_extend_select_index", select_index
+            )
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -821,6 +918,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
         ret_hidden_states = draft_logits_output.hidden_states
+        _log_hisparse_accept_debug(
+            compacted=getattr(forward_batch, "hisparse_draft_extend_compacted", False),
+            accept_lens=batch_result.accept_lens,
+            input_rows=int(forward_batch.input_ids.shape[0]),
+            select_index=select_index,
+            next_top1=ret_topk_index,
+        )
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -917,8 +1021,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_backends(self):
-        self._draft_worker.init_backends()
-        self._maybe_register_hisparse_draft_store()
+        self._draft_worker.init_backends(
+            pre_cuda_graph_hook=self._maybe_register_hisparse_draft_store
+        )
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (

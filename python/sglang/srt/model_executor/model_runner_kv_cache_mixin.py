@@ -62,6 +62,30 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+def _should_use_dense_over_hisparse_for_draft(
+    *,
+    is_draft_worker: bool,
+    enable_hisparse: bool,
+    allocator_is_hisparse: bool,
+    sparse_draft_requested: bool,
+    disaggregation_mode: str,
+    disaggregation_transfer_backend: str,
+) -> tuple[bool, bool]:
+    sparse_draft_pd_mooncake_unsupported = (
+        sparse_draft_requested
+        and is_draft_worker
+        and disaggregation_mode == "decode"
+        and str(disaggregation_transfer_backend).startswith("mooncake")
+    )
+    use_dense = (
+        is_draft_worker
+        and enable_hisparse
+        and allocator_is_hisparse
+        and (not sparse_draft_requested or sparse_draft_pd_mooncake_unsupported)
+    )
+    return use_dense, sparse_draft_pd_mooncake_unsupported
+
+
 class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # Use the snapshot taken at the end of this runner's weight-load phase,
@@ -315,17 +339,33 @@ class ModelRunnerKVCacheMixin:
         # draft forward path naturally skips the HiSparse device translation.
         # Default: dense-over-HiSparse workaround (draft gets an independent dense
         # pool). When SGLANG_HISPARSE_DRAFT_SPARSE is set, keep the draft on its
-        # own HiSparse sparse-attention store instead, so it sees the same sparse
-        # context the target verifies with. See docs_draft_hisparse_design.md.
-        self._draft_dense_over_hisparse = (
-            self.is_draft_worker
-            and self.enable_hisparse
-            and isinstance(
+        # own HiSparse sparse-attention store, except for Mooncake decode-PD: the
+        # current Mooncake HiSparse transfer sends target KV only, so the draft
+        # sparse store cannot materialize exact prefix MTP KV. In that unsupported
+        # case, fall back to the dense workaround to preserve draft quality.
+        sparse_draft_requested = envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+        (
+            self._draft_dense_over_hisparse,
+            sparse_draft_pd_mooncake_unsupported,
+        ) = _should_use_dense_over_hisparse_for_draft(
+            is_draft_worker=self.is_draft_worker,
+            enable_hisparse=self.enable_hisparse,
+            allocator_is_hisparse=isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
-            )
-            and not envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+            ),
+            sparse_draft_requested=sparse_draft_requested,
+            disaggregation_mode=self.server_args.disaggregation_mode,
+            disaggregation_transfer_backend=(
+                self.server_args.disaggregation_transfer_backend
+            ),
         )
         if self._draft_dense_over_hisparse:
+            if sparse_draft_pd_mooncake_unsupported:
+                logger.warning(
+                    "SGLANG_HISPARSE_DRAFT_SPARSE is set, but decode-PD with "
+                    "Mooncake transfers only target prefix KV; using dense-over-"
+                    "HiSparse draft pool instead of sparse draft store."
+                )
             self.enable_hisparse = False
 
         # Initialize req_to_token_pool

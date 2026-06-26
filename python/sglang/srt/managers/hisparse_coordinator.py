@@ -43,14 +43,18 @@ class HiSparseDraftStore:
     The draft model shares the target's slot bookkeeping -- the logical slot
     space (allocator + req_to_token_pool), the committed logical->device
     mapping (full_to_hisparse_device_index_mapping), the physical device-slot
-    allocation (req_to_device_buffer), and the host-slot allocation
-    (req_to_host_pool). Only two things are draft-specific:
+    allocation (req_to_device_buffer), and the host-slot numbers. Host-slot
+    validity is draft-specific because PD direct-to-host can populate target
+    KV without ever materializing draft/MTP KV for the prefix. Only these things
+    are draft-specific:
 
       1. the KV byte stores: `mem_pool_device` (draft device hot buffer) and
          `mem_pool_host` (draft host backup), indexed by the SAME slot numbers
          the target uses -- the coordinator just mirrors KV byte movement into
          these tensors.
-      2. the per-(layer, req, slot) swap-in residency state, because the draft
+      2. `req_to_host_pool`, a validity map for draft host KV at those shared
+         slot numbers.
+      3. the per-(layer, req, slot) swap-in residency state, because the draft
          MTP layer is a distinct layer that runs its own indexer/top-k during
          the draft proposal and therefore has its own hot set.
 
@@ -65,6 +69,7 @@ class HiSparseDraftStore:
         max_num_req_slots: int,
         padded_buffer_size: int,
         device_buffer_size: int,
+        host_map_size: int,
         item_size_bytes: int,
         device: str,
     ):
@@ -72,6 +77,13 @@ class HiSparseDraftStore:
         self.mem_pool_host = mem_pool_host
         self.layer_num = layer_num
         self.item_size_bytes = item_size_bytes
+
+        self.req_to_host_pool = torch.full(
+            (max_num_req_slots, host_map_size),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
 
         # Per-(layer, req, slot) residency state, sized to the DRAFT layer count.
         self.req_device_buffer_tokens = torch.full(
@@ -253,6 +265,7 @@ class HiSparseCoordinator:
         # Optional draft/MTP HiSparse store (set by register_draft_store when
         # SGLANG_HISPARSE_DRAFT_SPARSE is enabled).
         self._draft_store: Union[HiSparseDraftStore, None] = None
+        self._direct_draft_transfer_enabled = False
 
     def register_draft_store(self, draft_mem_pool_device) -> None:
         """Build an independent HiSparse store for the draft/MTP layers.
@@ -287,6 +300,7 @@ class HiSparseCoordinator:
             max_num_req_slots=self.max_num_req_slots,
             padded_buffer_size=self.padded_buffer_size,
             device_buffer_size=self.device_buffer_size,
+            host_map_size=self.req_to_host_pool.shape[1],
             item_size_bytes=draft_mem_pool_host.token_stride_size,
             device=self.device,
         )
@@ -308,6 +322,22 @@ class HiSparseCoordinator:
             self._draft_store.layer_num,
             draft_mem_pool_host.size,
         )
+
+    def get_draft_transfer_host_pool(self, draft_mem_pool_device):
+        if (
+            self._draft_store is None
+            or draft_mem_pool_device is not self._draft_store.mem_pool_device
+        ):
+            return None
+        return self._draft_store.mem_pool_host
+
+    def enable_direct_draft_transfer(self) -> None:
+        if not self._direct_draft_transfer_enabled:
+            logger.info(
+                "HiSparse direct draft KV transfer enabled: direct admission "
+                "will trust transferred draft host KV for prefix slots."
+            )
+        self._direct_draft_transfer_enabled = True
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -407,6 +437,9 @@ class HiSparseCoordinator:
                     device_indices,
                     io_backend="kernel",
                 )
+                self._draft_store.req_to_host_pool[req.req_pool_idx, :prefill_len] = (
+                    host_indices
+                )
             finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
@@ -443,11 +476,11 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
-            if self._draft_store is not None:
-                # Option B: mirror the empty-buffer reset for the draft store.
-                self._draft_store.req_device_buffer_tokens[
-                    :, req.req_pool_idx, : self.device_buffer_size
-                ] = -1
+
+        if self._direct_draft_transfer_enabled:
+            self._admit_direct_draft_prefix_from_transfer(req, host_len)
+        else:
+            self._seed_direct_draft_prefix_from_target(req, host_len)
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
@@ -472,18 +505,6 @@ class HiSparseCoordinator:
                 layer_id,
                 io_backend="kernel",
             )
-
-        if self._draft_store is not None:
-            # Option B: preload the draft hot buffer from the draft host pool at
-            # the same shared host/device slot numbers.
-            for layer_id in range(self._draft_store.mem_pool_device.layer_num):
-                self._draft_store.mem_pool_host.load_to_device_per_layer(
-                    self._draft_store.mem_pool_device,
-                    host_indices,
-                    device_locs,
-                    layer_id,
-                    io_backend="kernel",
-                )
 
     def alloc_device_buffer(self, req: Req) -> None:
         if self.is_dsv4_hisparse:
@@ -542,6 +563,130 @@ class HiSparseCoordinator:
             self._draft_store.req_device_buffer_token_locs[
                 :, req.req_pool_idx, :alloc_size
             ] = buffer_indices[:alloc_size]
+
+    def _clear_direct_draft_prefix_state(self, req_idx: int) -> None:
+        self._draft_store.req_device_buffer_tokens[
+            :, req_idx, : self.device_buffer_size
+        ] = -1
+        self._draft_store.req_to_host_pool[req_idx, :] = -1
+        self._draft_store.lru_slots[:, req_idx, :].copy_(self._lru_init)
+
+    def _invalidate_direct_draft_prefix(self, req: Req) -> None:
+        """Mark direct-to-host prefix slots invalid for sparse draft KV.
+
+        PD direct admission transfers target KV into host memory. Unless the
+        draft store has separately backed up draft KV, the same host slot numbers
+        must not be treated as valid draft KV. Keep device locs allocated so
+        future draft writes can still use the shared physical slots.
+        """
+        if self._draft_store is None:
+            return
+        req_idx = self._req_pool_idx(req)
+        if getattr(req, "hisparse_direct_draft_prefix_invalidated", False):
+            return
+        self._clear_direct_draft_prefix_state(req_idx)
+        req.hisparse_direct_draft_prefix_invalidated = True
+
+    def _seed_direct_draft_prefix_from_target(self, req: Req, host_len: int) -> None:
+        """Seed missing sparse draft prefix KV from transferred target KV.
+
+        Decode PREBUILT receives target KV directly in host memory but does not
+        run draft prefill. The exact draft/MTP prefix KV is therefore unavailable
+        on this path. Seeding from the final target layer is a best-effort
+        fallback that gives sparse draft attention nonzero historical context
+        instead of zeros or empty pages.
+        """
+        if self._draft_store is None:
+            return
+        req_idx = self._req_pool_idx(req)
+        if getattr(req, "hisparse_direct_draft_prefix_invalidated", False):
+            return
+
+        self._clear_direct_draft_prefix_state(req_idx)
+        if host_len <= 0:
+            req.hisparse_direct_draft_prefix_invalidated = True
+            return
+
+        host_locs = self.req_to_host_pool[req_idx, :host_len]
+        valid_positions = torch.nonzero(host_locs >= 0, as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            req.hisparse_direct_draft_prefix_invalidated = True
+            return
+
+        valid_host_locs = host_locs[valid_positions]
+        host_device = self.mem_pool_host.data_refs[0].device
+        valid_host_locs_host = valid_host_locs.to(device=host_device)
+        target_layer_id = self.mem_pool_host.layer_num - 1
+        self._draft_store.mem_pool_host.data_refs[0][valid_host_locs_host] = (
+            self.mem_pool_host.data_refs[target_layer_id][valid_host_locs_host]
+        )
+        self._draft_store.req_to_host_pool[req_idx, valid_positions] = valid_host_locs
+
+        if host_len <= self.device_buffer_size:
+            device_positions = valid_positions[
+                valid_positions < self.device_buffer_size
+            ]
+            if device_positions.numel() > 0:
+                device_host_locs = self._draft_store.req_to_host_pool[
+                    req_idx, device_positions
+                ]
+                device_locs = self.req_to_device_buffer[req_idx, device_positions]
+                self._draft_store.mem_pool_host.load_to_device_per_layer(
+                    self._draft_store.mem_pool_device,
+                    device_host_locs,
+                    device_locs,
+                    0,
+                    io_backend="kernel",
+                )
+                self._draft_store.req_device_buffer_tokens[
+                    :, req_idx, device_positions
+                ] = device_positions.to(torch.int32).unsqueeze(0)
+
+        req.hisparse_direct_draft_prefix_invalidated = True
+
+    def _admit_direct_draft_prefix_from_transfer(self, req: Req, host_len: int) -> None:
+        """Mark draft prefix KV transferred by PD direct-to-host as valid."""
+        if self._draft_store is None:
+            return
+        req_idx = self._req_pool_idx(req)
+        if getattr(req, "hisparse_direct_draft_prefix_invalidated", False):
+            return
+
+        self._clear_direct_draft_prefix_state(req_idx)
+        if host_len <= 0:
+            req.hisparse_direct_draft_prefix_invalidated = True
+            return
+
+        host_locs = self.req_to_host_pool[req_idx, :host_len]
+        valid_positions = torch.nonzero(host_locs >= 0, as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            req.hisparse_direct_draft_prefix_invalidated = True
+            return
+
+        valid_host_locs = host_locs[valid_positions]
+        self._draft_store.req_to_host_pool[req_idx, valid_positions] = valid_host_locs
+
+        if host_len <= self.device_buffer_size:
+            device_positions = valid_positions[
+                valid_positions < self.device_buffer_size
+            ]
+            if device_positions.numel() > 0:
+                device_host_locs = self._draft_store.req_to_host_pool[
+                    req_idx, device_positions
+                ]
+                device_locs = self.req_to_device_buffer[req_idx, device_positions]
+                self._draft_store.mem_pool_host.load_to_device_per_layer(
+                    self._draft_store.mem_pool_device,
+                    device_host_locs,
+                    device_locs,
+                    0,
+                    io_backend="kernel",
+                )
+                self._draft_store.req_device_buffer_tokens[
+                    :, req_idx, device_positions
+                ] = device_positions.to(torch.int32).unsqueeze(0)
+
+        req.hisparse_direct_draft_prefix_invalidated = True
 
     def _grow_device_buffers(
         self,
@@ -829,6 +974,9 @@ class HiSparseCoordinator:
                     device_locs,
                     io_backend="kernel",
                 )
+                self._draft_store.req_to_host_pool[
+                    backup_req_indices, actual_compressed_pos
+                ] = host_locs
             self._backup_done_event.record()
             if host_locs.is_cuda:
                 host_locs.record_stream(self.decode_backup_stream)
@@ -1050,7 +1198,37 @@ class HiSparseCoordinator:
             self._draft_store.req_device_buffer_tokens[:, row_indices, col_indices] = (
                 token_positions.to(torch.int32).unsqueeze(0)
             )
-        return self.req_to_device_buffer[row_indices, col_indices]
+        device_slots = self.req_to_device_buffer[row_indices, col_indices]
+        if envs.SGLANG_HISPARSE_SPEC_DEBUG.get():
+            self._spec_debug_record_draft(
+                row_indices, col_indices, token_positions, device_slots
+            )
+        return device_slots
+
+    def prepare_draft_slots(
+        self,
+        req_pool_indices: torch.Tensor,
+        draft_cache_locs: torch.Tensor,
+        num_tokens_per_req: int,
+        start_positions_cpu: torch.Tensor,
+    ) -> None:
+        """Bind the current draft-write window to HiSparse device slots."""
+        assert self.supports_hisparse_draft_slots()
+        total_slots = req_pool_indices.numel() * num_tokens_per_req
+        if draft_cache_locs.numel() != total_slots:
+            raise ValueError(
+                "HiSparse draft slot mismatch: "
+                f"expected {total_slots} cache locs, got {draft_cache_locs.numel()}."
+            )
+
+        device_slots = self.get_draft_device_slots(
+            req_pool_indices=req_pool_indices,
+            num_tokens_per_req=num_tokens_per_req,
+            start_positions_cpu=start_positions_cpu,
+        )
+        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            draft_cache_locs
+        ] = device_slots
 
     def get_draft_device_slots_variable(
         self,
@@ -1164,6 +1342,8 @@ class HiSparseCoordinator:
         device_slots: torch.Tensor,
     ) -> None:
         """Compare verify-side mapping against the recorded draft-side mapping."""
+        if not self._spec_debug_has_comparable_draft_slots():
+            return
         draft_map = getattr(self, "_spec_debug_draft_map", None)
         rows = row_indices.detach().cpu().tolist()
         cols = col_indices.detach().cpu().tolist()
@@ -1204,7 +1384,7 @@ class HiSparseCoordinator:
             mismatch,
             (" examples=" + "; ".join(examples)) if examples else "",
         )
-        if shared == 0:
+        if shared == 0 and self._draft_store is not None:
             logger.warning(
                 "[hisparse-spec-debug] draft and verify token positions DO NOT OVERLAP "
                 "at all -> draft KV columns are never the ones verify reads."
@@ -1256,30 +1436,48 @@ class HiSparseCoordinator:
             start + pos_in_segment,
         )
         device_slots = self.req_to_device_buffer[row_indices, col_indices]
-        if envs.SGLANG_HISPARSE_SPEC_DEBUG.get():
+        if (
+            envs.SGLANG_HISPARSE_SPEC_DEBUG.get()
+            and self._spec_debug_has_comparable_draft_slots()
+        ):
             self._spec_debug_compare_verify(
                 row_indices, col_indices, token_positions, device_slots
             )
             # Direct, physical-slot-keyed check: what device column did the draft
             # model's KV write map verify_cache_locs to, vs what verify now reads?
+            draft_map = getattr(self, "_spec_debug_draft_map", None)
+            rows = row_indices.detach().cpu().tolist()
+            positions = token_positions.detach().cpu().tolist()
             mapping = (
                 self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
             )
-            prev = mapping[verify_cache_locs].detach().cpu().tolist()
-            new = device_slots.detach().cpu().tolist()
+            prev_all = mapping[verify_cache_locs].detach().cpu().tolist()
+            new_all = device_slots.detach().cpu().tolist()
+            if draft_map:
+                compare_indices = [
+                    i
+                    for i, (r, p) in enumerate(zip(rows, positions))
+                    if (int(r), int(p)) in draft_map
+                ]
+            else:
+                compare_indices = list(range(len(new_all)))
+            skipped_verify_only = len(new_all) - len(compare_indices)
+            prev = [prev_all[i] for i in compare_indices]
+            new = [new_all[i] for i in compare_indices]
             n = len(new)
             n_mismatch = sum(1 for a, b in zip(prev, new) if int(a) != int(b))
             n_prev_zero = sum(1 for a in prev if int(a) == 0)
             ex = [
                 f"loc#{i}: draft_map={int(a)} verify_map={int(b)}"
-                for i, (a, b) in enumerate(zip(prev, new))
+                for i, a, b in zip(compare_indices, prev, new)
                 if int(a) != int(b)
             ][:8]
             logger.info(
-                "[hisparse-spec-debug] PHYS-SLOT cmp: n=%d mismatched=%d draft_map_zero=%d %s",
+                "[hisparse-spec-debug] PHYS-SLOT cmp: n=%d mismatched=%d draft_map_zero=%d skipped_verify_only=%d %s",
                 n,
                 n_mismatch,
                 n_prev_zero,
+                skipped_verify_only,
                 ("examples=" + "; ".join(ex)) if ex else "",
             )
         self.req_device_buffer_tokens[:, row_indices, col_indices] = token_positions.to(
@@ -1288,6 +1486,14 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
             verify_cache_locs
         ] = device_slots
+
+    def _spec_debug_has_comparable_draft_slots(self) -> bool:
+        # In Mooncake decode-PD fallback, sparse-draft env is set but the draft
+        # model intentionally uses a dense pool. Its slots are not comparable
+        # with target HiSparse verify slots, so these debug checks are invalid.
+        return (
+            self._draft_store is not None or not envs.SGLANG_HISPARSE_DRAFT_SPARSE.get()
+        )
 
     def finalize_accepted_tokens(
         self,
@@ -1388,6 +1594,10 @@ class HiSparseCoordinator:
 
             self._backup_device_locs_to_host(host_locs, backup_device_locs)
             self.req_to_host_pool[backup_req_indices, backup_positions] = host_locs
+            if self._draft_store is not None:
+                self._draft_store.req_to_host_pool[
+                    backup_req_indices, backup_positions
+                ] = host_locs
             full_to_device_mapping[accepted_cache_locs[needs_backup]] = (
                 backup_device_locs
             )
@@ -1643,6 +1853,8 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        if self._draft_store is not None:
+            self._draft_store.req_to_host_pool[req.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
@@ -1690,7 +1902,10 @@ class HiSparseCoordinator:
             # a reused req_idx does not inherit stale draft occupancy/LRU.
             self._draft_store.req_device_buffer_tokens[:, req_idx, :] = -1
             self._draft_store.req_device_buffer_token_locs[:, req_idx, :] = -1
+            self._draft_store.req_to_host_pool[req_idx, :] = -1
             self._draft_store.lru_slots[:, req_idx, :].copy_(self._lru_init)
+            if hasattr(req, "hisparse_direct_draft_prefix_invalidated"):
+                del req.hisparse_direct_draft_prefix_invalidated
 
         return host_len
 
@@ -1837,6 +2052,8 @@ class HiSparseCoordinator:
         stale_host_indices = self.req_to_host_pool[req_idx, host_len:]
         self._free_host_indices(stale_host_indices)
         self.req_to_host_pool[req_idx, host_len:] = -1
+        if self._draft_store is not None:
+            self._draft_store.req_to_host_pool[req_idx, host_len:] = -1
         if not self._ensure_host_backed(req, preserve_len, host_len):
             return False
         req.hisparse_retracted_host_indices = self.req_to_host_pool[
@@ -1845,6 +2062,8 @@ class HiSparseCoordinator:
         req.hisparse_retracted_host_len = host_len
         self._clear_req_device_state(req)
         self.req_to_host_pool[req_idx, :] = -1
+        if self._draft_store is not None:
+            self._draft_store.req_to_host_pool[req_idx, :] = -1
         self.req_to_host_pool_allocated_len[req_idx] = 0
         return True
 
@@ -1859,6 +2078,8 @@ class HiSparseCoordinator:
         )
         self._free_host_indices(host_indices)
         self.req_to_host_pool[req_idx, :] = -1
+        if self._draft_store is not None:
+            self._draft_store.req_to_host_pool[req_idx, :] = -1
         self.req_to_host_pool_allocated_len[req_idx] = 0
         self._clear_retracted_host_indices(req)
 
@@ -1898,6 +2119,7 @@ class HiSparseCoordinator:
             store_buffer_locs = store.req_device_buffer_token_locs
             store_lru = store.lru_slots
             store_item_size = store.item_size_bytes
+            store_req_to_host = store.req_to_host_pool
         else:
             store_device = self.mem_pool_device
             store_host = self.mem_pool_host
@@ -1905,9 +2127,7 @@ class HiSparseCoordinator:
             store_buffer_locs = self.req_device_buffer_token_locs
             store_lru = self.lru_slots
             store_item_size = self.item_size_bytes
-        # Host-slot allocation is shared in option B (draft host pool is indexed
-        # by the same slot numbers the target allocated).
-        store_req_to_host = self.req_to_host_pool
+            store_req_to_host = self.req_to_host_pool
         # Per-layer arrays / kv buffers are indexed by the pool-local layer id.
         # Target pools start at layer 0 (no change); the draft pool starts at
         # its MTP layer id, so subtract start_layer to land at local index 0.

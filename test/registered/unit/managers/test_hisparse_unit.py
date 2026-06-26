@@ -10,6 +10,7 @@ Tests cover:
 import os
 import unittest
 from array import array
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -108,6 +109,364 @@ def test_schedule_batch_hisparse_spec_v2_host_budget_uses_current_alloc_helper(
     )
 
     assert batch._host_tokens_required_next_decode_spec([object(), object()]) == 10
+
+
+def test_compact_topk1_accepted_draft_extend_inputs():
+    from sglang.srt.speculative.base_spec_worker import (
+        compact_topk1_accepted_draft_extend_inputs,
+    )
+
+    num_draft_tokens = 6
+    predict = torch.arange(12, dtype=torch.int64)
+    hidden_states = torch.arange(24, dtype=torch.float32).view(12, 2)
+    out_cache_loc = torch.arange(100, 112, dtype=torch.int64)
+    accept_lens = torch.tensor([2, 4], dtype=torch.int64)
+
+    (
+        compact_predict,
+        compact_hidden_states,
+        compact_out_cache_loc,
+        select_index,
+    ) = compact_topk1_accepted_draft_extend_inputs(
+        predict=predict,
+        hidden_states=hidden_states,
+        out_cache_loc=out_cache_loc,
+        accept_lens=accept_lens,
+        num_draft_tokens=num_draft_tokens,
+    )
+
+    expected_indices = torch.tensor([0, 1, 6, 7, 8, 9], dtype=torch.int64)
+    assert torch.equal(compact_predict, predict[expected_indices])
+    assert torch.equal(compact_hidden_states, hidden_states[expected_indices])
+    assert torch.equal(compact_out_cache_loc, out_cache_loc[expected_indices])
+    assert torch.equal(select_index, torch.tensor([1, 5], dtype=torch.int64))
+
+
+def test_repeat_draft_extend_v2_page_table_uses_compacted_lens():
+    from sglang.srt.layers.attention.dsa_backend import (
+        _repeat_draft_extend_v2_page_table,
+    )
+
+    page_table = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    extend_seq_lens = torch.tensor([2, 4], dtype=torch.int32)
+
+    compacted = _repeat_draft_extend_v2_page_table(
+        page_table=page_table,
+        extend_seq_lens=extend_seq_lens,
+        speculative_num_draft_tokens=6,
+        compacted=True,
+    )
+    fixed = _repeat_draft_extend_v2_page_table(
+        page_table=page_table,
+        extend_seq_lens=extend_seq_lens,
+        speculative_num_draft_tokens=6,
+        compacted=False,
+    )
+
+    assert torch.equal(
+        compacted,
+        torch.tensor(
+            [
+                [10, 11],
+                [10, 11],
+                [20, 21],
+                [20, 21],
+                [20, 21],
+                [20, 21],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    assert fixed.shape[0] == page_table.shape[0] * 6
+
+
+def test_hisparse_draft_extend_swap_handles_single_step_result():
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+    class _ForwardBatch:
+        req_pool_indices = torch.tensor([3, 5], dtype=torch.int64)
+        extend_seq_lens_cpu = [1, 1]
+
+    class _Metadata:
+        dsa_extend_seq_lens_list = [1, 1]
+        dsa_seqlens_expanded = torch.tensor([10, 20], dtype=torch.int32)
+
+    class _Coordinator:
+        def swap_in_selected_pages(
+            self,
+            req_pool_indices,
+            compressed_seq_lens,
+            top_k_result,
+            layer_id,
+            token_position_space,
+            num_steps,
+            mem_pool_device,
+        ):
+            assert num_steps == 1
+            assert top_k_result.shape == (2, 1, 3)
+            return torch.tensor([[101, 102, 103], [201, 202, 203]], dtype=torch.int32)
+
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.token_to_kv_pool = object()
+    topk_indices = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
+
+    page_table = backend._swap_in_hisparse_draft_extend_pages(
+        _ForwardBatch(),
+        _Metadata(),
+        topk_indices,
+        layer_id=0,
+        hisparse_coordinator=_Coordinator(),
+    )
+
+    assert torch.equal(
+        page_table,
+        torch.tensor([[101, 102, 103], [201, 202, 203]], dtype=torch.int32),
+    )
+
+
+def test_hisparse_sparse_draft_direct_prefix_is_invalidated():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.device_buffer_size = 4
+    coordinator._lru_init = torch.arange(4, dtype=torch.int16)
+    draft_store = SimpleNamespace(
+        req_device_buffer_tokens=torch.arange(6, dtype=torch.int32).view(1, 1, 6),
+        req_to_host_pool=torch.arange(8, dtype=torch.int64).view(1, 8),
+        lru_slots=torch.full((1, 1, 4), -7, dtype=torch.int16),
+    )
+    coordinator._draft_store = draft_store
+    req = _make_req("direct-draft")
+    req.req_pool_idx = 0
+
+    coordinator._invalidate_direct_draft_prefix(req)
+
+    assert torch.equal(
+        draft_store.req_device_buffer_tokens[:, 0, :4],
+        torch.full((1, 4), -1, dtype=torch.int32),
+    )
+    assert torch.equal(
+        draft_store.req_to_host_pool[0],
+        torch.full((8,), -1, dtype=torch.int64),
+    )
+    assert torch.equal(draft_store.lru_slots[0, 0], coordinator._lru_init)
+    assert req.hisparse_direct_draft_prefix_invalidated is True
+
+
+def test_hisparse_sparse_draft_direct_prefix_can_seed_from_target_host():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    class _DraftHost:
+        def __init__(self):
+            self.data_refs = [torch.zeros((8, 1), dtype=torch.float32)]
+
+        def load_to_device_per_layer(
+            self, device_pool, host_indices, device_indices, layer_id, io_backend
+        ):
+            assert io_backend == "kernel"
+            host_indices = host_indices.to(torch.int64)
+            device_indices = device_indices.to(torch.int64)
+            device_pool.kv_buffer[layer_id][device_indices] = self.data_refs[layer_id][
+                host_indices
+            ]
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.device_buffer_size = 4
+    coordinator._lru_init = torch.arange(4, dtype=torch.int16)
+    coordinator.req_to_host_pool = torch.tensor(
+        [[2, 3, 4, -1, -1, -1, -1, -1]], dtype=torch.int64
+    )
+    coordinator.req_to_device_buffer = torch.tensor(
+        [[20, 21, 22, 23, 24, 0]], dtype=torch.int64
+    )
+    target_layer_0 = torch.zeros((8, 1), dtype=torch.float32)
+    target_layer_1 = torch.arange(80, 88, dtype=torch.float32).view(8, 1)
+    coordinator.mem_pool_host = SimpleNamespace(
+        data_refs=[target_layer_0, target_layer_1],
+        layer_num=2,
+    )
+    draft_host = _DraftHost()
+    draft_device = SimpleNamespace(
+        kv_buffer=[torch.zeros((32, 1), dtype=torch.float32)]
+    )
+    draft_store = SimpleNamespace(
+        mem_pool_host=draft_host,
+        mem_pool_device=draft_device,
+        req_device_buffer_tokens=torch.zeros((1, 1, 6), dtype=torch.int32),
+        req_to_host_pool=torch.full((1, 8), -1, dtype=torch.int64),
+        lru_slots=torch.full((1, 1, 4), -7, dtype=torch.int16),
+    )
+    coordinator._draft_store = draft_store
+    req = _make_req("direct-draft-seed")
+    req.req_pool_idx = 0
+
+    coordinator._seed_direct_draft_prefix_from_target(req, host_len=3)
+
+    assert torch.equal(
+        draft_host.data_refs[0][torch.tensor([2, 3, 4])],
+        target_layer_1[torch.tensor([2, 3, 4])],
+    )
+    assert torch.equal(
+        draft_device.kv_buffer[0][torch.tensor([20, 21, 22])],
+        target_layer_1[torch.tensor([2, 3, 4])],
+    )
+    assert torch.equal(
+        draft_store.req_to_host_pool[0, :4],
+        torch.tensor([2, 3, 4, -1], dtype=torch.int64),
+    )
+    assert torch.equal(
+        draft_store.req_device_buffer_tokens[:, 0, :4],
+        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+    )
+    assert req.hisparse_direct_draft_prefix_invalidated is True
+
+
+def test_hisparse_sparse_draft_direct_prefix_can_use_transferred_draft_host():
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    class _DraftHost:
+        def __init__(self):
+            self.data_refs = [torch.arange(100, 108, dtype=torch.float32).view(8, 1)]
+
+        def load_to_device_per_layer(
+            self, device_pool, host_indices, device_indices, layer_id, io_backend
+        ):
+            assert io_backend == "kernel"
+            host_indices = host_indices.to(torch.int64)
+            device_indices = device_indices.to(torch.int64)
+            device_pool.kv_buffer[layer_id][device_indices] = self.data_refs[layer_id][
+                host_indices
+            ]
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.device_buffer_size = 4
+    coordinator._lru_init = torch.arange(4, dtype=torch.int16)
+    coordinator.req_to_host_pool = torch.tensor(
+        [[2, 3, 4, -1, -1, -1, -1, -1]], dtype=torch.int64
+    )
+    coordinator.req_to_device_buffer = torch.tensor(
+        [[20, 21, 22, 23, 24, 0]], dtype=torch.int64
+    )
+    coordinator.mem_pool_host = SimpleNamespace(
+        data_refs=[
+            torch.zeros((8, 1), dtype=torch.float32),
+            torch.arange(80, 88, dtype=torch.float32).view(8, 1),
+        ],
+        layer_num=2,
+    )
+    draft_host = _DraftHost()
+    draft_device = SimpleNamespace(
+        kv_buffer=[torch.zeros((32, 1), dtype=torch.float32)]
+    )
+    draft_store = SimpleNamespace(
+        mem_pool_host=draft_host,
+        mem_pool_device=draft_device,
+        req_device_buffer_tokens=torch.zeros((1, 1, 6), dtype=torch.int32),
+        req_to_host_pool=torch.full((1, 8), -1, dtype=torch.int64),
+        lru_slots=torch.full((1, 1, 4), -7, dtype=torch.int16),
+    )
+    coordinator._draft_store = draft_store
+    req = _make_req("direct-draft-transfer")
+    req.req_pool_idx = 0
+
+    assert coordinator.get_draft_transfer_host_pool(draft_device) is draft_host
+    coordinator._admit_direct_draft_prefix_from_transfer(req, host_len=3)
+
+    assert torch.equal(
+        draft_host.data_refs[0][torch.tensor([2, 3, 4])],
+        torch.tensor([[102.0], [103.0], [104.0]]),
+    )
+    assert torch.equal(
+        draft_device.kv_buffer[0][torch.tensor([20, 21, 22])],
+        torch.tensor([[102.0], [103.0], [104.0]]),
+    )
+    assert torch.equal(
+        draft_store.req_to_host_pool[0, :4],
+        torch.tensor([2, 3, 4, -1], dtype=torch.int64),
+    )
+    assert torch.equal(
+        draft_store.req_device_buffer_tokens[:, 0, :4],
+        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+    )
+    assert req.hisparse_direct_draft_prefix_invalidated is True
+
+
+def test_hisparse_sparse_draft_swap_uses_draft_host_validity_map(monkeypatch):
+    import sglang.srt.managers.hisparse_coordinator as hisparse_module
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.top_k = 2
+    coordinator.device = "cpu"
+    coordinator.device_buffer_size = 4
+    coordinator.is_dsv4_hisparse = False
+    coordinator.num_real_reqs = torch.tensor([1], dtype=torch.int32)
+    coordinator.top_k_device_locs_buffer = torch.full((1, 2), -1, dtype=torch.int32)
+    coordinator.req_to_host_pool = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
+    coordinator.req_device_buffer_tokens = torch.full((1, 1, 5), -1, dtype=torch.int32)
+    coordinator.req_device_buffer_token_locs = torch.full(
+        (1, 1, 5), -1, dtype=torch.int32
+    )
+    coordinator.lru_slots = torch.arange(4, dtype=torch.int16).view(1, 1, 4)
+    coordinator.item_size_bytes = 1
+    coordinator.mem_pool_device = SimpleNamespace(
+        start_layer=0,
+        page_size=1,
+        kv_buffer=[torch.zeros((4, 1), dtype=torch.float32)],
+    )
+    coordinator.mem_pool_host = SimpleNamespace(
+        kv_buffer=[torch.zeros((4, 1), dtype=torch.float32)]
+    )
+
+    draft_device = SimpleNamespace(
+        start_layer=7,
+        page_size=1,
+        kv_buffer=[torch.ones((4, 1), dtype=torch.float32)],
+    )
+    draft_store = SimpleNamespace(
+        mem_pool_device=draft_device,
+        mem_pool_host=SimpleNamespace(
+            kv_buffer=[torch.ones((4, 1), dtype=torch.float32)]
+        ),
+        req_to_host_pool=torch.tensor([[-1, -1, 20, 21]], dtype=torch.int64),
+        req_device_buffer_tokens=torch.full((1, 1, 5), -1, dtype=torch.int32),
+        req_device_buffer_token_locs=torch.full((1, 1, 5), -1, dtype=torch.int32),
+        lru_slots=torch.arange(4, dtype=torch.int16).view(1, 1, 4),
+        item_size_bytes=1,
+    )
+    coordinator._draft_store = draft_store
+
+    captured = {}
+
+    def fake_load_cache_to_device_buffer_mla(**kwargs):
+        captured["host_cache_locs"] = kwargs["host_cache_locs"]
+        kwargs["top_k_device_locs"].fill_(42)
+
+    monkeypatch.setattr(
+        hisparse_module,
+        "load_cache_to_device_buffer_mla",
+        fake_load_cache_to_device_buffer_mla,
+    )
+
+    out = coordinator.swap_in_selected_pages(
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+        compressed_seq_lens=torch.tensor([4], dtype=torch.int64),
+        top_k_result=torch.tensor([[0, 2]], dtype=torch.int32),
+        layer_id=7,
+        mem_pool_device=draft_device,
+    )
+
+    assert captured["host_cache_locs"] is draft_store.req_to_host_pool
+    assert captured["host_cache_locs"] is not coordinator.req_to_host_pool
+    assert torch.equal(out, torch.full((1, 2), 42, dtype=torch.int32))
+
+
+def test_hisparse_short_static_loc_requires_matching_residency_label():
+    source = (
+        Path(__file__).parents[4] / "python/sglang/jit_kernel/csrc/hisparse.cuh"
+    ).read_text()
+
+    assert "req_device_buffer_tokens[token_idx] != token_idx" in source
 
 
 class TestHiSparseUnit(unittest.TestCase):
@@ -1174,6 +1533,184 @@ class TestHiSparseUnit(unittest.TestCase):
             self.coordinator.request_finished(req)
             self._free_req_slot(req)
         self._assert_sizes_restored(initial, "draft_slots_variable")
+
+    def test_prepare_draft_slots_rebinds_cleared_preallocated_locs(self):
+        """A reused draft logical window is rebound after finalize clears mapping."""
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE
+        draft_num = 3
+        req = _make_req("draft-slots-rebind", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        draft_device_slots = self.coordinator.get_draft_device_slots(
+            req_pool_indices,
+            draft_num,
+            start_positions_cpu,
+        )
+
+        device = self.allocator.device
+        prefix_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+        prefix_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        seq_lens = torch.tensor(
+            [fill_len + draft_num], dtype=torch.int64, device=device
+        )
+        seq_lens_cpu = torch.tensor([fill_len + draft_num], dtype=torch.int64)
+        draft_cache_locs = self.allocator.alloc_extend_with_device_mapping(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=kv_loc[-1:].to(device=device),
+            extend_num_tokens=draft_num,
+            device_slots=draft_device_slots,
+        )
+        self.req_to_token_pool.write(
+            (req_idx, slice(fill_len, fill_len + draft_num)), draft_cache_locs
+        )
+        req.kv_allocated_len = fill_len + draft_num
+        req.kv_committed_len = fill_len + draft_num
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        self.assertTrue(torch.equal(mapping[draft_cache_locs], draft_device_slots))
+
+        mapping[draft_cache_locs] = 0
+        self.assertTrue(torch.all(mapping[draft_cache_locs] == 0))
+
+        self.coordinator.prepare_draft_slots(
+            req_pool_indices=req_pool_indices,
+            draft_cache_locs=draft_cache_locs,
+            num_tokens_per_req=draft_num,
+            start_positions_cpu=start_positions_cpu,
+        )
+
+        rebound_slots = self.coordinator.req_to_device_buffer[
+            req_idx, DEVICE_BUFFER_SIZE + 1 : DEVICE_BUFFER_SIZE + 1 + draft_num
+        ]
+        self.assertTrue(torch.equal(mapping[draft_cache_locs], rebound_slots))
+        self.assertTrue(torch.all(mapping[draft_cache_locs] > 0))
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(
+            torch.cat([kv_loc, draft_cache_locs])
+        )
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "draft_slots_rebind")
+
+    def test_uniform_draft_slots_record_current_debug_window(self):
+        """Uniform draft slots update the spec-debug draft window."""
+        from sglang.srt.environ import envs
+
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE
+        draft_num = 3
+        req = _make_req("draft-slots-debug", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        extra_start = DEVICE_BUFFER_SIZE + 1
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([fill_len], dtype=torch.int64)
+
+        self.coordinator._spec_debug_draft_map = {
+            (req_idx, fill_len + 99): (extra_start, 12345)
+        }
+        with envs.SGLANG_HISPARSE_SPEC_DEBUG.override(True):
+            device_slots = self.coordinator.get_draft_device_slots(
+                req_pool_indices,
+                draft_num,
+                start_positions_cpu,
+            )
+
+        draft_map = self.coordinator._spec_debug_draft_map
+        self.assertEqual(len(draft_map), draft_num)
+        for i, slot in enumerate(device_slots.detach().cpu().tolist()):
+            self.assertEqual(
+                draft_map[(req_idx, fill_len + i)],
+                (extra_start + i, int(slot)),
+            )
+
+        self._cleanup_req(req, kv_loc)
+        self._assert_sizes_restored(initial, "draft_slots_debug")
+
+    def test_verify_slot_debug_skips_bonus_slot(self):
+        """Physical-slot debug compares only positions written by draft."""
+        from sglang.srt.environ import envs
+
+        initial = self._get_initial_sizes()
+        fill_len = DEVICE_BUFFER_SIZE
+        draft_num = 5
+        verify_num = draft_num + 1
+        req = _make_req("verify-slot-debug", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+
+        req_idx = req.req_pool_idx
+        req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device="cuda")
+        start_positions_cpu = torch.tensor([fill_len], dtype=torch.int64)
+
+        with envs.SGLANG_HISPARSE_SPEC_DEBUG.override(True):
+            draft_device_slots = self.coordinator.get_draft_device_slots(
+                req_pool_indices,
+                draft_num,
+                start_positions_cpu,
+            )
+
+        device = self.allocator.device
+        prefix_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+        prefix_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+        seq_lens = torch.tensor(
+            [fill_len + verify_num], dtype=torch.int64, device=device
+        )
+        seq_lens_cpu = torch.tensor([fill_len + verify_num], dtype=torch.int64)
+        verify_cache_locs = self.allocator.alloc_extend(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=kv_loc[-1:].to(device=device),
+            extend_num_tokens=verify_num,
+        )
+        self.assertIsNotNone(verify_cache_locs)
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping
+        mapping[verify_cache_locs[:draft_num]] = draft_device_slots
+        mapping[verify_cache_locs[draft_num:]] = 0
+
+        with (
+            envs.SGLANG_HISPARSE_SPEC_DEBUG.override(True),
+            self.assertLogs(
+                "sglang.srt.managers.hisparse_coordinator", level="INFO"
+            ) as logs,
+        ):
+            self.coordinator.prepare_verify_slots_spec_v2(
+                req_pool_indices=req_pool_indices,
+                verify_cache_locs=verify_cache_locs,
+                num_tokens_per_req=verify_num,
+                start_positions_cpu=start_positions_cpu,
+            )
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("COMPARE: shared_positions=5 mismatched=0", log_text)
+        self.assertIn(
+            "PHYS-SLOT cmp: n=5 mismatched=0 draft_map_zero=0 skipped_verify_only=1",
+            log_text,
+        )
+
+        self.coordinator.request_finished(req)
+        self.allocator.free(torch.cat([kv_loc, verify_cache_locs]))
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "verify_slot_debug_skips_bonus")
 
     def test_draft_logical_alloc_allows_in_page_extend_with_no_free_pages(self):
         """Draft logical allocation can extend inside an existing page at 0 free pages."""

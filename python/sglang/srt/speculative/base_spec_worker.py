@@ -66,6 +66,36 @@ def duplicate_prefix_tail_to_draft_branches(
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
 
+def compact_topk1_accepted_draft_extend_inputs(
+    predict: torch.Tensor,
+    hidden_states: torch.Tensor | None,
+    out_cache_loc: torch.Tensor,
+    accept_lens: torch.Tensor,
+    num_draft_tokens: int,
+):
+    """Compact topk=1 draft-extend inputs to the accepted prefix of each row."""
+    accept_lens = accept_lens.to(device=predict.device, dtype=torch.int64)
+    bs = accept_lens.numel()
+    steps = torch.arange(num_draft_tokens, device=predict.device, dtype=torch.int64)
+    row_offsets = (
+        torch.arange(bs, device=predict.device, dtype=torch.int64).unsqueeze(1)
+        * num_draft_tokens
+    )
+    keep = steps.unsqueeze(0) < accept_lens.unsqueeze(1)
+    flat_indices = (row_offsets + steps.unsqueeze(0)).reshape(-1)[keep.reshape(-1)]
+
+    compact_hidden_states = (
+        hidden_states[flat_indices] if hidden_states is not None else None
+    )
+    select_index = torch.cumsum(accept_lens, dim=0) - 1
+    return (
+        predict[flat_indices],
+        compact_hidden_states,
+        out_cache_loc[flat_indices],
+        select_index,
+    )
+
+
 class EagleDraftWorkerBase(ABC):
     @abstractmethod
     def draft():
@@ -106,9 +136,51 @@ class EagleDraftWorkerBase(ABC):
         from sglang.srt.utils.common import is_npu
 
         bs = len(batch.seq_lens)
-        extend_num_tokens = bs * num_draft_tokens
         # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
         gpu_only = batch.seq_lens_cpu is None
+
+        hisparse_compact_draft_extend = False
+        compact_select_index = None
+        accept_lens_cpu = None
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+        draft_uses_hisparse_mapping = hasattr(
+            draft_model_runner.token_to_kv_pool,
+            "translate_loc_to_hisparse_device",
+        )
+        draft_topk = getattr(
+            getattr(draft_model_runner, "server_args", None),
+            "speculative_eagle_topk",
+            None,
+        )
+        if (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and draft_uses_hisparse_mapping
+            and draft_topk == 1
+            and draft_extend_input.num_accept_tokens is not None
+            and not batch.forward_mode.is_idle()
+        ):
+            (
+                predict,
+                draft_extend_input.hidden_states,
+                batch.out_cache_loc,
+                compact_select_index,
+            ) = compact_topk1_accepted_draft_extend_inputs(
+                predict=predict,
+                hidden_states=draft_extend_input.hidden_states,
+                out_cache_loc=batch.out_cache_loc,
+                accept_lens=draft_extend_input.num_accept_tokens,
+                num_draft_tokens=num_draft_tokens,
+            )
+            accept_lens_cpu = [
+                int(x)
+                for x in draft_extend_input.num_accept_tokens.detach().cpu().tolist()
+            ]
+            draft_extend_input.num_accept_tokens_cpu = accept_lens_cpu
+            extend_num_tokens = sum(accept_lens_cpu)
+            hisparse_compact_draft_extend = True
+        else:
+            extend_num_tokens = bs * num_draft_tokens
 
         batch.spec_info = draft_extend_input
         # Normalize draft token ids before ForwardBatch construction; DeepSeekV4 DP
@@ -124,12 +196,24 @@ class EagleDraftWorkerBase(ABC):
         # gpu_only emits device tensors to skip H2D.
         if gpu_only:
             batch.prefix_lens = batch.seq_lens.to(torch.int32)
-            batch.extend_lens = torch.full(
-                (bs,), num_draft_tokens, dtype=torch.int32, device=batch.seq_lens.device
-            )
+            if hisparse_compact_draft_extend:
+                batch.extend_lens = draft_extend_input.num_accept_tokens.to(
+                    device=batch.seq_lens.device, dtype=torch.int32
+                )
+            else:
+                batch.extend_lens = torch.full(
+                    (bs,),
+                    num_draft_tokens,
+                    dtype=torch.int32,
+                    device=batch.seq_lens.device,
+                )
         else:
             batch.prefix_lens = batch.seq_lens_cpu.tolist()
-            batch.extend_lens = [num_draft_tokens] * bs
+            batch.extend_lens = (
+                accept_lens_cpu
+                if hisparse_compact_draft_extend
+                else [num_draft_tokens] * bs
+            )
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL
@@ -143,16 +227,40 @@ class EagleDraftWorkerBase(ABC):
         )
         batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        # Forward sees post-write length (draft extend writes num_draft_tokens
-        # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+        # Forward sees post-write length; mutation stays on forward_batch to
+        # preserve SB.seq_lens until the scheduler commits the verify result.
+        seq_lens_increment = (
+            draft_extend_input.num_accept_tokens.to(
+                device=forward_batch.seq_lens.device, dtype=forward_batch.seq_lens.dtype
+            )
+            if hisparse_compact_draft_extend
+            else num_draft_tokens
+        )
+        forward_batch.seq_lens = forward_batch.seq_lens + seq_lens_increment
         if not gpu_only:
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+            if hisparse_compact_draft_extend:
+                seq_lens_cpu_increment = torch.tensor(
+                    accept_lens_cpu, dtype=forward_batch.seq_lens_cpu.dtype
+                )
+                forward_batch.seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu + seq_lens_cpu_increment
+                )
+            else:
+                forward_batch.seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu + num_draft_tokens
+                )
             forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
         else:
-            # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
-            # backend max() reads from list without a per-iter D2H sync.
-            forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+            # Supply CPU mirror so backend max()/sum() reads from a list
+            # without a per-iter D2H sync in the fixed-length path.
+            forward_batch.extend_seq_lens_cpu = (
+                accept_lens_cpu
+                if hisparse_compact_draft_extend
+                else [num_draft_tokens] * bs
+            )
+        if hisparse_compact_draft_extend:
+            forward_batch.hisparse_draft_extend_compacted = True
+            forward_batch.hisparse_draft_extend_select_index = compact_select_index
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
             draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -249,13 +357,27 @@ class EagleDraftWorkerBase(ABC):
                     page_size,
                 )
 
-            # NOTE: Under HiSparse the draft model runs on an independent DENSE KV
-            # pool (see ModelRunnerKVCacheMixin._draft_dense_over_hisparse), so it
-            # does NOT read through full_to_hisparse_device_index_mapping. The target
-            # verify window sets up its own tree-token device slots via
-            # HiSparseCoordinator.prepare_verify_slots_spec_v2, so no draft-side
-            # device-slot binding is needed here. (dsv4 HiSparse never reaches this
-            # path: supports_hisparse_draft_slots() is False for it.)
+            hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+            draft_uses_hisparse_mapping = hasattr(
+                draft_model_runner.token_to_kv_pool,
+                "translate_loc_to_hisparse_device",
+            )
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+                and draft_uses_hisparse_mapping
+            ):
+                seq_lens_cpu = (
+                    batch.seq_lens_cpu
+                    if batch.seq_lens_cpu is not None
+                    else batch.seq_lens.cpu()
+                )
+                hisparse_coordinator.prepare_draft_slots(
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_cache_locs=batch.out_cache_loc,
+                    num_tokens_per_req=topk * num_steps,
+                    start_positions_cpu=seq_lens_cpu,
+                )
 
         # Get a forward batch
         draft_input.num_tokens_per_req = topk

@@ -100,6 +100,16 @@ def _uses_hisparse_device_mapping(token_to_kv_pool) -> bool:
     return callable(translate_loc)
 
 
+def _repeat_draft_extend_v2_page_table(
+    page_table: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    speculative_num_draft_tokens: int,
+    compacted: bool,
+) -> torch.Tensor:
+    repeats = extend_seq_lens if compacted else speculative_num_draft_tokens
+    return torch.repeat_interleave(page_table, repeats=repeats, dim=0)
+
+
 # Reuse this workspace buffer across all DSA backend instances
 global_workspace_buffer = None
 
@@ -425,13 +435,13 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
-    def get_device_int32_arange(self, l: int) -> torch.Tensor:
-        if l > len(self._arange_buf):
-            next_pow_of_2 = 1 << (l - 1).bit_length()
+    def get_device_int32_arange(self, length: int) -> torch.Tensor:
+        if length > len(self._arange_buf):
+            next_pow_of_2 = 1 << (length - 1).bit_length()
             self._arange_buf = torch.arange(
                 next_pow_of_2, device=self.device, dtype=torch.int32
             )
-        return self._arange_buf[:l]
+        return self._arange_buf[:length]
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_size
@@ -559,20 +569,17 @@ class DeepseekSparseAttnBackend(
                 sum(extend_seq_lens_cpu),
                 self.speculative_num_draft_tokens,
             )
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
-                # tokens upfront. All requests extend by the same fixed
-                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
-                page_table = torch.repeat_interleave(
-                    page_table, repeats=self.speculative_num_draft_tokens, dim=0
-                )
-            else:
-                # DRAFT_EXTEND: the draft worker extends by (num_correct_drafts + 1)
-                # per request after verification. Lengths vary per request based on
-                # how many tokens were accepted.
-                page_table = torch.repeat_interleave(
-                    page_table, repeats=forward_batch.extend_seq_lens, dim=0
-                )
+            # DRAFT_EXTEND_V2 normally pre-fills all speculated tokens upfront.
+            # HiSparse compact mode keeps only accepted prefixes, so its page
+            # table must use the same per-request lengths as the query rows.
+            page_table = _repeat_draft_extend_v2_page_table(
+                page_table=page_table,
+                extend_seq_lens=forward_batch.extend_seq_lens,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                compacted=getattr(
+                    forward_batch, "hisparse_draft_extend_compacted", False
+                ),
+            )
         elif forward_batch.forward_mode.is_extend():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
@@ -2316,6 +2323,8 @@ class DeepseekSparseAttnBackend(
             num_steps=max_steps,
             mem_pool_device=self.token_to_kv_pool,
         )
+        if swapped.dim() == 2:
+            swapped = swapped.unsqueeze(1)
 
         rows = [
             swapped[req_idx, :extend_len]

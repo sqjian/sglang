@@ -128,6 +128,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
 template <int HOT_BUFFER_SIZE, bool IsDsv4Layout>
 __device__ __forceinline__ bool try_get_static_device_loc(
     int32_t token_idx,
+    const int32_t* __restrict__ req_device_buffer_tokens,
     const int32_t* __restrict__ req_device_buffer_locs,
     int64_t page_size,
     int32_t* __restrict__ out_loc) {
@@ -135,6 +136,9 @@ __device__ __forceinline__ bool try_get_static_device_loc(
     return false;
   } else {
     if (token_idx < 0 || token_idx >= HOT_BUFFER_SIZE) {
+      return false;
+    }
+    if (req_device_buffer_tokens[token_idx] != token_idx) {
       return false;
     }
     const int32_t loc = req_device_buffer_locs[token_idx];
@@ -296,7 +300,7 @@ __global__ void load_cache_to_device_buffer_kernel(
         int32_t token_pos = step_top_k_tokens[i];
         int32_t loc = -1;
         if (try_get_static_device_loc<HOT_BUFFER_SIZE, IsDsv4Layout>(
-                token_pos, req_device_buffer_locs, page_size, &loc) ||
+                token_pos, req_device_buffer_tokens, req_device_buffer_locs, page_size, &loc) ||
             try_get_extra_page_device_loc<HOT_BUFFER_SIZE, IsDsv4Layout>(
                 token_pos,
                 seq_len,

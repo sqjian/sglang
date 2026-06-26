@@ -6,15 +6,24 @@ tests check that the pre-allocated `parent_list` / `top_scores_index` match the
 slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
+import contextlib
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+    _should_use_dense_over_hisparse_for_draft,
+)
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_v2 import (
+    EagleDraftWorker,
+    EAGLEWorkerV2,
+    _should_share_mtp_topk_indices,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,8 +117,119 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    def test_sparse_hisparse_draft_disables_mtp_topk_reuse(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_HISPARSE_DRAFT_SPARSE", None)
+            self.assertTrue(
+                _should_share_mtp_topk_indices(
+                    config_enabled=True,
+                    topk=1,
+                    server_args=SimpleNamespace(enable_hisparse=True),
+                )
+            )
+
+        with patch.dict(os.environ, {"SGLANG_HISPARSE_DRAFT_SPARSE": "1"}):
+            self.assertFalse(
+                _should_share_mtp_topk_indices(
+                    config_enabled=True,
+                    topk=1,
+                    server_args=SimpleNamespace(enable_hisparse=True),
+                )
+            )
+            self.assertTrue(
+                _should_share_mtp_topk_indices(
+                    config_enabled=True,
+                    topk=1,
+                    server_args=SimpleNamespace(enable_hisparse=False),
+                )
+            )
+            self.assertTrue(
+                _should_share_mtp_topk_indices(
+                    config_enabled=True,
+                    topk=1,
+                    server_args=SimpleNamespace(enable_hisparse=True),
+                    draft_uses_hisparse_mapping=False,
+                )
+            )
+
+    def test_sparse_hisparse_draft_falls_back_for_mooncake_decode_pd(self):
+        use_dense, unsupported = _should_use_dense_over_hisparse_for_draft(
+            is_draft_worker=True,
+            enable_hisparse=True,
+            allocator_is_hisparse=True,
+            sparse_draft_requested=True,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+        )
+        self.assertTrue(use_dense)
+        self.assertTrue(unsupported)
+
+        use_dense, unsupported = _should_use_dense_over_hisparse_for_draft(
+            is_draft_worker=True,
+            enable_hisparse=True,
+            allocator_is_hisparse=True,
+            sparse_draft_requested=True,
+            disaggregation_mode="null",
+            disaggregation_transfer_backend="mooncake",
+        )
+        self.assertFalse(use_dense)
+        self.assertFalse(unsupported)
+
+        use_dense, unsupported = _should_use_dense_over_hisparse_for_draft(
+            is_draft_worker=True,
+            enable_hisparse=True,
+            allocator_is_hisparse=True,
+            sparse_draft_requested=False,
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mooncake",
+        )
+        self.assertTrue(use_dense)
+        self.assertFalse(unsupported)
+
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
+    def test_draft_init_hook_runs_before_cuda_graph_capture(self):
+        worker = object.__new__(EagleDraftWorker)
+        order = []
+        worker.draft_tp_context = lambda _group: contextlib.nullcontext()
+        worker.draft_runner = SimpleNamespace(tp_group=object(), canary_manager=None)
+        worker.draft_worker = SimpleNamespace(
+            init_backends=lambda disable_cuda_graph: order.append(
+                ("base", disable_cuda_graph)
+            )
+        )
+        worker.init_attention_backend = lambda: order.append(("attention", None))
+        worker.init_cuda_graphs = lambda: order.append(("cuda_graphs", None))
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_backend_context",
+                contextlib.nullcontext,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.speculative_moe_a2a_backend_context",
+                contextlib.nullcontext,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
+                return_value=False,
+            ),
+        ):
+            EagleDraftWorker.init_backends(
+                worker,
+                pre_cuda_graph_hook=lambda: order.append(("hook", None)),
+            )
+
+        self.assertEqual(
+            order,
+            [
+                ("base", True),
+                ("attention", None),
+                ("hook", None),
+                ("cuda_graphs", None),
+            ],
+        )
+
     def test_preserves_initialized_backend_when_draft_extend_backend_is_unset(self):
         worker = object.__new__(EagleDraftWorker)
         existing_backend = object()
