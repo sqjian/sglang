@@ -258,12 +258,17 @@ def test_hisparse_sparse_draft_direct_prefix_can_seed_from_target_host():
 
     class _DraftHost:
         def __init__(self):
-            self.data_refs = [torch.zeros((8, 1), dtype=torch.float32)]
+            self.data_refs = [
+                torch.zeros((8, 1), dtype=torch.float32),
+                torch.zeros((8, 1), dtype=torch.float32),
+            ]
+            self.load_calls = []
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
         ):
             assert io_backend == "kernel"
+            self.load_calls.append(layer_id)
             host_indices = host_indices.to(torch.int64)
             device_indices = device_indices.to(torch.int64)
             device_pool.kv_buffer[layer_id][device_indices] = self.data_refs[layer_id][
@@ -287,14 +292,18 @@ def test_hisparse_sparse_draft_direct_prefix_can_seed_from_target_host():
     )
     draft_host = _DraftHost()
     draft_device = SimpleNamespace(
-        kv_buffer=[torch.zeros((32, 1), dtype=torch.float32)]
+        kv_buffer=[
+            torch.zeros((32, 1), dtype=torch.float32),
+            torch.zeros((32, 1), dtype=torch.float32),
+        ]
     )
     draft_store = SimpleNamespace(
         mem_pool_host=draft_host,
         mem_pool_device=draft_device,
-        req_device_buffer_tokens=torch.zeros((1, 1, 6), dtype=torch.int32),
+        layer_num=2,
+        req_device_buffer_tokens=torch.full((2, 1, 6), -1, dtype=torch.int32),
         req_to_host_pool=torch.full((1, 8), -1, dtype=torch.int64),
-        lru_slots=torch.full((1, 1, 4), -7, dtype=torch.int16),
+        lru_slots=torch.full((2, 1, 4), -7, dtype=torch.int16),
     )
     coordinator._draft_store = draft_store
     req = _make_req("direct-draft-seed")
@@ -306,17 +315,23 @@ def test_hisparse_sparse_draft_direct_prefix_can_seed_from_target_host():
         draft_host.data_refs[0][torch.tensor([2, 3, 4])],
         target_layer_1[torch.tensor([2, 3, 4])],
     )
-    assert torch.equal(
-        draft_device.kv_buffer[0][torch.tensor([20, 21, 22])],
-        target_layer_1[torch.tensor([2, 3, 4])],
-    )
+    for layer_id in range(draft_store.layer_num):
+        assert torch.equal(
+            draft_host.data_refs[layer_id][torch.tensor([2, 3, 4])],
+            target_layer_1[torch.tensor([2, 3, 4])],
+        )
+        assert torch.equal(
+            draft_device.kv_buffer[layer_id][torch.tensor([20, 21, 22])],
+            target_layer_1[torch.tensor([2, 3, 4])],
+        )
+    assert draft_host.load_calls == [0, 1]
     assert torch.equal(
         draft_store.req_to_host_pool[0, :4],
         torch.tensor([2, 3, 4, -1], dtype=torch.int64),
     )
     assert torch.equal(
         draft_store.req_device_buffer_tokens[:, 0, :4],
-        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, -1], [0, 1, 2, -1]], dtype=torch.int32),
     )
     assert req.hisparse_direct_draft_prefix_invalidated is True
 
@@ -326,12 +341,17 @@ def test_hisparse_sparse_draft_direct_prefix_can_use_transferred_draft_host():
 
     class _DraftHost:
         def __init__(self):
-            self.data_refs = [torch.arange(100, 108, dtype=torch.float32).view(8, 1)]
+            self.data_refs = [
+                torch.arange(100, 108, dtype=torch.float32).view(8, 1),
+                torch.arange(200, 208, dtype=torch.float32).view(8, 1),
+            ]
+            self.load_calls = []
 
         def load_to_device_per_layer(
             self, device_pool, host_indices, device_indices, layer_id, io_backend
         ):
             assert io_backend == "kernel"
+            self.load_calls.append(layer_id)
             host_indices = host_indices.to(torch.int64)
             device_indices = device_indices.to(torch.int64)
             device_pool.kv_buffer[layer_id][device_indices] = self.data_refs[layer_id][
@@ -356,14 +376,18 @@ def test_hisparse_sparse_draft_direct_prefix_can_use_transferred_draft_host():
     )
     draft_host = _DraftHost()
     draft_device = SimpleNamespace(
-        kv_buffer=[torch.zeros((32, 1), dtype=torch.float32)]
+        kv_buffer=[
+            torch.zeros((32, 1), dtype=torch.float32),
+            torch.zeros((32, 1), dtype=torch.float32),
+        ]
     )
     draft_store = SimpleNamespace(
         mem_pool_host=draft_host,
         mem_pool_device=draft_device,
-        req_device_buffer_tokens=torch.zeros((1, 1, 6), dtype=torch.int32),
+        layer_num=2,
+        req_device_buffer_tokens=torch.full((2, 1, 6), -1, dtype=torch.int32),
         req_to_host_pool=torch.full((1, 8), -1, dtype=torch.int64),
-        lru_slots=torch.full((1, 1, 4), -7, dtype=torch.int16),
+        lru_slots=torch.full((2, 1, 4), -7, dtype=torch.int16),
     )
     coordinator._draft_store = draft_store
     req = _make_req("direct-draft-transfer")
@@ -381,12 +405,17 @@ def test_hisparse_sparse_draft_direct_prefix_can_use_transferred_draft_host():
         torch.tensor([[102.0], [103.0], [104.0]]),
     )
     assert torch.equal(
+        draft_device.kv_buffer[1][torch.tensor([20, 21, 22])],
+        torch.tensor([[202.0], [203.0], [204.0]]),
+    )
+    assert draft_host.load_calls == [0, 1]
+    assert torch.equal(
         draft_store.req_to_host_pool[0, :4],
         torch.tensor([2, 3, 4, -1], dtype=torch.int64),
     )
     assert torch.equal(
         draft_store.req_device_buffer_tokens[:, 0, :4],
-        torch.tensor([[0, 1, 2, -1]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, -1], [0, 1, 2, -1]], dtype=torch.int32),
     )
     assert req.hisparse_direct_draft_prefix_invalidated is True
 

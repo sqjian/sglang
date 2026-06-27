@@ -587,6 +587,26 @@ class HiSparseCoordinator:
         self._clear_direct_draft_prefix_state(req_idx)
         req.hisparse_direct_draft_prefix_invalidated = True
 
+    def _load_direct_draft_prefix_to_device(
+        self, req_idx: int, device_positions: torch.Tensor
+    ) -> None:
+        if device_positions.numel() == 0:
+            return
+
+        device_host_locs = self._draft_store.req_to_host_pool[req_idx, device_positions]
+        device_locs = self.req_to_device_buffer[req_idx, device_positions]
+        for layer_id in range(self._draft_store.layer_num):
+            self._draft_store.mem_pool_host.load_to_device_per_layer(
+                self._draft_store.mem_pool_device,
+                device_host_locs,
+                device_locs,
+                layer_id,
+                io_backend="kernel",
+            )
+        self._draft_store.req_device_buffer_tokens[:, req_idx, device_positions] = (
+            device_positions.to(torch.int32).unsqueeze(0)
+        )
+
     def _seed_direct_draft_prefix_from_target(self, req: Req, host_len: int) -> None:
         """Seed missing sparse draft prefix KV from transferred target KV.
 
@@ -617,30 +637,20 @@ class HiSparseCoordinator:
         host_device = self.mem_pool_host.data_refs[0].device
         valid_host_locs_host = valid_host_locs.to(device=host_device)
         target_layer_id = self.mem_pool_host.layer_num - 1
-        self._draft_store.mem_pool_host.data_refs[0][valid_host_locs_host] = (
-            self.mem_pool_host.data_refs[target_layer_id][valid_host_locs_host]
-        )
+        seed_values = self.mem_pool_host.data_refs[target_layer_id][
+            valid_host_locs_host
+        ]
+        for draft_layer_id in range(self._draft_store.layer_num):
+            self._draft_store.mem_pool_host.data_refs[draft_layer_id][
+                valid_host_locs_host
+            ] = seed_values
         self._draft_store.req_to_host_pool[req_idx, valid_positions] = valid_host_locs
 
         if host_len <= self.device_buffer_size:
             device_positions = valid_positions[
                 valid_positions < self.device_buffer_size
             ]
-            if device_positions.numel() > 0:
-                device_host_locs = self._draft_store.req_to_host_pool[
-                    req_idx, device_positions
-                ]
-                device_locs = self.req_to_device_buffer[req_idx, device_positions]
-                self._draft_store.mem_pool_host.load_to_device_per_layer(
-                    self._draft_store.mem_pool_device,
-                    device_host_locs,
-                    device_locs,
-                    0,
-                    io_backend="kernel",
-                )
-                self._draft_store.req_device_buffer_tokens[
-                    :, req_idx, device_positions
-                ] = device_positions.to(torch.int32).unsqueeze(0)
+            self._load_direct_draft_prefix_to_device(req_idx, device_positions)
 
         req.hisparse_direct_draft_prefix_invalidated = True
 
@@ -670,21 +680,7 @@ class HiSparseCoordinator:
             device_positions = valid_positions[
                 valid_positions < self.device_buffer_size
             ]
-            if device_positions.numel() > 0:
-                device_host_locs = self._draft_store.req_to_host_pool[
-                    req_idx, device_positions
-                ]
-                device_locs = self.req_to_device_buffer[req_idx, device_positions]
-                self._draft_store.mem_pool_host.load_to_device_per_layer(
-                    self._draft_store.mem_pool_device,
-                    device_host_locs,
-                    device_locs,
-                    0,
-                    io_backend="kernel",
-                )
-                self._draft_store.req_device_buffer_tokens[
-                    :, req_idx, device_positions
-                ] = device_positions.to(torch.int32).unsqueeze(0)
+            self._load_direct_draft_prefix_to_device(req_idx, device_positions)
 
         req.hisparse_direct_draft_prefix_invalidated = True
 
