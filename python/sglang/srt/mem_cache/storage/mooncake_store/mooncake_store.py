@@ -299,6 +299,13 @@ class MooncakeBaseStore:
             )
 
 
+def _resolve_extra_backend_tag(extra_config: Optional[dict]) -> Optional[str]:
+    if not extra_config or "extra_backend_tag" not in extra_config:
+        return None
+    tag = os.path.expandvars(str(extra_config["extra_backend_tag"]))
+    return tag or None
+
+
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     @staticmethod
@@ -372,10 +379,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
-            self.extra_backend_tag = None
-            if extra_config and "extra_backend_tag" in extra_config:
-                self.extra_backend_tag = extra_config["extra_backend_tag"]
+            self.extra_backend_tag = _resolve_extra_backend_tag(extra_config)
+            if self.extra_backend_tag is not None:
                 logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
+            self.disable_storage_io = (
+                envs.SGLANG_HICACHE_MOONCAKE_DISABLE_STORAGE_IO.get()
+            )
+            if self.disable_storage_io:
+                logger.warning(
+                    "Mooncake storage I/O disabled by %s; setup/register/attach "
+                    "remain enabled, but storage exists/get/set calls will be "
+                    "short-circuited.",
+                    envs.SGLANG_HICACHE_MOONCAKE_DISABLE_STORAGE_IO.name,
+                )
 
             # Check server status
             if self.config.check_server:
@@ -488,8 +504,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
             )
-            self.warmup()
-            logger.info("Mooncake store warmup successfully.")
+            warmup_delay = envs.SGLANG_HICACHE_MOONCAKE_WARMUP_DELAY_SECONDS.get()
+            if warmup_delay > 0:
+                logger.info(
+                    "Delaying Mooncake store warmup for %.3f seconds by %s.",
+                    warmup_delay,
+                    envs.SGLANG_HICACHE_MOONCAKE_WARMUP_DELAY_SECONDS.name,
+                )
+                time.sleep(warmup_delay)
+            if self.disable_storage_io:
+                logger.info(
+                    "Mooncake store warmup skipped because storage I/O is disabled by %s.",
+                    envs.SGLANG_HICACHE_MOONCAKE_DISABLE_STORAGE_IO.name,
+                )
+            elif envs.SGLANG_HICACHE_MOONCAKE_SKIP_WARMUP.get():
+                logger.info(
+                    "Mooncake store warmup skipped by %s.",
+                    envs.SGLANG_HICACHE_MOONCAKE_SKIP_WARMUP.name,
+                )
+            else:
+                self.warmup()
+                logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:
@@ -725,6 +760,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        if self.disable_storage_io:
+            return PoolTransferResult(0, {})
+
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
@@ -774,6 +812,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         return PoolTransferResult(final_pages, hit_count)
 
+    def _transfer_page_count(self, transfer: PoolTransfer) -> int:
+        if transfer.keys is not None:
+            return len(transfer.keys)
+        host_indices = transfer.host_indices
+        if host_indices is None:
+            return 0
+        host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+        page_size = getattr(host_pool, "page_size", 1) or 1
+        return len(host_indices) // page_size
+
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
@@ -822,6 +870,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
+        if self.disable_storage_io:
+            return {
+                transfer.name: [False] * self._transfer_page_count(transfer)
+                for transfer in transfers
+            }
         return self._batch_io_v2(transfers, is_set=False)
 
     def batch_set_v2(
@@ -829,6 +882,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
+        if self.disable_storage_io:
+            return {
+                transfer.name: [True] * self._transfer_page_count(transfer)
+                for transfer in transfers
+            }
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
@@ -940,6 +998,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.disable_storage_io:
+            return [False] * len(keys)
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -969,6 +1029,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.disable_storage_io:
+            return [True] * len(keys)
         if self.mem_pool_host.kv_buffer is None:
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
@@ -1019,6 +1081,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_location: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+        if self.disable_storage_io:
+            return True
         # Only support zero copy set for now
         assert target_location is not None and target_sizes is not None
         exist_result = self._batch_exist([key])
@@ -1036,6 +1100,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+        if self.disable_storage_io:
+            return True
         # Only support zero copy set for now
         assert target_locations is not None and target_sizes is not None
         assert len(keys) == len(target_locations) == len(target_sizes)
@@ -1093,6 +1159,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        if self.disable_storage_io:
+            return False
         assert target_location is not None and target_sizes is not None
         get_result = self._get_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
@@ -1105,6 +1173,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
+        if self.disable_storage_io:
+            return 0
         assert len(keys) == len(target_locations) == len(target_sizes)
         if len(keys) == 0:
             return 0
@@ -1132,12 +1202,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(keys) // key_multiplier
 
     def exists(self, key) -> bool:
+        if self.disable_storage_io:
+            return False
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if self.disable_storage_io:
+            return 0
         # Apply extra_backend_tag prefix if available
         keys = self._tag_keys(keys)
 
