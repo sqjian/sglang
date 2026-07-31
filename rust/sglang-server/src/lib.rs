@@ -11,6 +11,7 @@
 //! All are non-blocking, so the GIL is never held across a wait.
 
 mod api_server;
+mod bootstrap;
 mod detokenizer;
 mod environ;
 mod error;
@@ -223,6 +224,38 @@ impl Server {
     }
 }
 
+/// PD prefill KV bootstrap registry on a dedicated listener and native thread.
+/// It is separate from [`Server`] because the scheduler must start it before
+/// transfer queues synchronously register and before the main Rust frontend
+/// runtime is created.
+#[pyclass]
+struct BootstrapServer {
+    handle: Option<crate::bootstrap::Handle>,
+}
+
+#[pymethods]
+impl BootstrapServer {
+    #[new]
+    fn start(host: &str, port: u16) -> PyResult<Self> {
+        let handle = crate::bootstrap::start(host, port).map_err(|error| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "bootstrap server start failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            handle: Some(handle),
+        })
+    }
+
+    /// Stop the listener and join its thread. Dropping the Python object has
+    /// the same effect through the native handle's `Drop` implementation.
+    fn close(&mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            handle.close();
+        }
+    }
+}
+
 /// Keeps the non-blocking log writer's background thread alive for the process
 /// lifetime (dropping the guard would stop log delivery).
 static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
@@ -246,5 +279,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
     m.add_class::<Server>()?;
     m.add_class::<IngressBatch>()?;
+    m.add_class::<BootstrapServer>()?;
     Ok(())
 }

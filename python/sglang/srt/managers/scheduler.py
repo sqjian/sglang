@@ -84,6 +84,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.disagg_service import start_rust_disagg_service
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -1193,6 +1194,11 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        # The prefill KV manager below registers synchronously, so its registry
+        # must already be listening. In Rust-server mode no TokenizerManager
+        # process exists to own that registry.
+        self.maybe_init_disagg_bootstrap_server()
+
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool = kv_cache_builder.get_draft_kv_pool(
             draft_worker=self.draft_worker,
@@ -1824,17 +1830,29 @@ class Scheduler(
         else:
             self.scripted_scheduler_hook = None
 
+    def _hosts_rust_server(self) -> bool:
+        """Whether this scheduler rank owns the embedded Rust frontend."""
+        return envs.SGLANG_RUST_SERVER.get() and (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+        )
+
+    def maybe_init_disagg_bootstrap_server(self) -> None:
+        """Start and retain the native prefill bootstrap registry when this
+        scheduler owns the Rust frontend."""
+        self.disagg_bootstrap_server = (
+            start_rust_disagg_service(self.server_args)
+            if self._hosts_rust_server()
+            else None
+        )
+
     def maybe_init_rust_server(self) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
-        is_rank_zero = (
-            self.ps.pp_rank == 0
-            and self.ps.attn_tp_rank == 0
-            and self.ps.attn_cp_rank == 0
-        )
-        if not (envs.SGLANG_RUST_SERVER.get() and is_rank_zero):
+        if not self._hosts_rust_server():
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
@@ -2270,9 +2288,10 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    recv_req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": error_msg}
-                    )
+                    if recv_req.time_stats is not None:
+                        recv_req.time_stats.trace_ctx.abort(
+                            abort_info={"reason": error_msg}
+                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return

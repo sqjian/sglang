@@ -61,6 +61,27 @@ fn health_routes() -> Router<AppState> {
         .route("/health_generate", probe)
 }
 
+const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
+/// Build the cheapest scheduler round-trip used by `/health_generate`. PD
+/// roles carry the same fake bootstrap pair as Python's health endpoint.
+fn health_probe(server_args: &crate::runtime::ServerArgs) -> GenerateRequest {
+    let is_disaggregation = server_args.is_disaggregation();
+    GenerateRequest {
+        rid: Rid::new_health_check(),
+        input_ids: Some(vec![0]),
+        sampling_params: SamplingParams {
+            max_new_tokens: Some(1),
+            temperature: 0.0,
+            ..Default::default()
+        },
+        stream: false,
+        bootstrap_host: is_disaggregation.then(|| FAKE_BOOTSTRAP_HOST.into()),
+        bootstrap_room: is_disaggregation.then_some(0),
+        ..Default::default()
+    }
+}
+
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
 /// producing output. 200 iff the egress heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
@@ -80,19 +101,7 @@ async fn health_generate(State(state): State<AppState>, timeout: std::time::Dura
     // Fire the probe (the heartbeat is the signal, not its own response). A busy
     // scheduler skips it with no terminal frame, so its detok registration is
     // cleaned up only by the `AbortGuard` below.
-    let probe = GenerateRequest {
-        // The `HEALTH_CHECK_<uuid>` rid form
-        rid: Rid::new_health_check(),
-        input_ids: Some(vec![0]),
-        // One greedy token: the cheapest round-trip that still produces a frame.
-        sampling_params: SamplingParams {
-            max_new_tokens: Some(1),
-            temperature: 0.0,
-            ..Default::default()
-        },
-        stream: false,
-        ..Default::default()
-    };
+    let probe = health_probe(&state.server_args);
     let (rid, _keepalive) =
         match submit(&state, RequestKind::Generate(Box::new(probe)), false).await {
             // Hold the receiver so the probe's sink stays open until it completes.
@@ -597,6 +606,25 @@ mod tests {
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"
             );
+        }
+    }
+
+    #[test]
+    fn health_probe_injects_fake_bootstrap_only_for_pd_roles() {
+        let unified = crate::runtime::ServerArgs::from_json("{}").unwrap();
+        let probe = health_probe(&unified);
+        assert!(probe.rid.starts_with("HEALTH_CHECK_"));
+        assert_eq!(probe.bootstrap_host, None);
+        assert_eq!(probe.bootstrap_room, None);
+
+        for role in ["prefill", "decode"] {
+            let args = crate::runtime::ServerArgs::from_json(&format!(
+                r#"{{"disaggregation_mode": "{role}"}}"#
+            ))
+            .unwrap();
+            let probe = health_probe(&args);
+            assert_eq!(probe.bootstrap_host.as_deref(), Some("2.2.2.2"));
+            assert_eq!(probe.bootstrap_room, Some(0));
         }
     }
 }

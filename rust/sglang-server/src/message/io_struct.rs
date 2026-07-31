@@ -30,6 +30,23 @@ wire_struct! {
         /// Not exposed by this server yet; the scheduler needs the slot filled.
         return_sampling_mask: bool,
         return_hidden_states: bool,
+        /// Compatibility filler through Python's PD block. These fields retain
+        /// their Python defaults so the bootstrap fields land at indices 24–30.
+        return_routed_experts: bool,
+        routed_experts_start_len: i64,
+        return_indexer_topk: bool,
+        session_id: (),
+        session_params: (),
+        lora_id: (),
+        custom_logit_processor: (),
+        positional_embed_overrides: (),
+        bootstrap_host: Option<&'a str>,
+        bootstrap_port: Option<i64>,
+        bootstrap_room: Option<i64>,
+        bootstrap_pair_key: Option<&'a str>,
+        decode_tp_size: Option<i64>,
+        routed_dp_rank: Option<i64>,
+        disagg_prefill_dp_rank: Option<i64>,
     }
 }
 
@@ -75,6 +92,21 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             stream: req.stream,
             return_sampling_mask: req.return_sampling_mask,
             return_hidden_states: req.return_hidden_states,
+            return_routed_experts: false,
+            routed_experts_start_len: 0,
+            return_indexer_topk: false,
+            session_id: (),
+            session_params: (),
+            lora_id: (),
+            custom_logit_processor: (),
+            positional_embed_overrides: (),
+            bootstrap_host: req.bootstrap_host.as_deref(),
+            bootstrap_port: req.bootstrap_port,
+            bootstrap_room: req.bootstrap_room,
+            bootstrap_pair_key: req.bootstrap_pair_key.as_deref(),
+            decode_tp_size: req.decode_tp_size,
+            routed_dp_rank: req.routed_dp_rank,
+            disagg_prefill_dp_rank: req.disagg_prefill_dp_rank,
         }
     }
 }
@@ -141,12 +173,9 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // msgspec requires >= 14 (through `stream`); we emit 16.
-        assert!(
-            arr.len() >= 14,
-            "header must have >=14 elements, got {}",
-            arr.len()
-        );
+        // The header ends at `disagg_prefill_dp_rank`; Python default-fills
+        // every trailing field introduced after this compatibility boundary.
+        assert_eq!(arr.len(), 31);
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -169,5 +198,42 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 15"
         );
+    }
+
+    /// Python decodes `TokenizedGenerateReqInput` positionally. The default
+    /// filler block must keep the PD fields at indices 24 through 30.
+    #[test]
+    fn bootstrap_block_is_positionally_aligned() {
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            text: Some("hi".into()),
+            bootstrap_host: Some("10.0.0.1".into()),
+            bootstrap_port: Some(8998),
+            bootstrap_room: Some(i64::MAX),
+            bootstrap_pair_key: Some("pair".into()),
+            decode_tp_size: Some(2),
+            routed_dp_rank: Some(3),
+            disagg_prefill_dp_rank: Some(4),
+            ..Default::default()
+        };
+
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let fields = value.as_array().expect("array");
+
+        assert_eq!(fields.len(), 31);
+        assert_eq!(fields[16].as_bool(), Some(false));
+        assert_eq!(fields[17].as_i64(), Some(0));
+        assert_eq!(fields[18].as_bool(), Some(false));
+        for (index, field) in fields.iter().enumerate().take(24).skip(19) {
+            assert!(field.is_nil(), "idx {index} must be a nil default");
+        }
+        assert_eq!(fields[24].as_str(), Some("10.0.0.1"));
+        assert_eq!(fields[25].as_i64(), Some(8998));
+        assert_eq!(fields[26].as_i64(), Some(i64::MAX));
+        assert_eq!(fields[27].as_str(), Some("pair"));
+        assert_eq!(fields[28].as_i64(), Some(2));
+        assert_eq!(fields[29].as_i64(), Some(3));
+        assert_eq!(fields[30].as_i64(), Some(4));
     }
 }

@@ -45,6 +45,10 @@ mod sealed {
     impl SealedItem for i64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
+    // PD router batch fields are `List[Optional[T]]`; a missing element must
+    // remain distinguishable until request fanout flattens the column.
+    impl SealedItem for Option<i64> {}
+    impl SealedItem for Option<String> {}
 }
 
 /// A msgspec `tag=True` struct: element 0 of its array is the Python class name
