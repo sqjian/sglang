@@ -51,9 +51,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hcu, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hcu = is_hcu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
@@ -107,6 +108,69 @@ class HostTensorAllocator(abc.ABC):
         self.dims = dims
         tensor = torch.empty(dims, dtype=dtype, device=device)
         return tensor
+
+
+class HiSparseHostPoolMixin:
+    def _round_up_to_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        return self.alloc(num_pages * self.page_size)
+
+    def alloc_paged_token_slots(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Allocate request host slots by page and return token-granular slots."""
+        device = req_to_host_pool.device
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+
+        allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
+        end_pos = start_pos + num_tokens
+        page_end = self._round_up_to_page_size(end_pos)
+        assert start_pos <= allocated_len
+
+        if page_end > allocated_len:
+            num_new_pages = (page_end - allocated_len) // self.page_size
+            host_locs = self.alloc_page(num_new_pages)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_new_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
+                )
+
+            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
+                device=device, non_blocking=True
+            )
+            req_to_host_pool_allocated_len[req_pool_idx] = page_end
+
+        return req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def allocated_host_indices(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        allocated_len: int,
+    ) -> torch.Tensor:
+        allocated_len = int(allocated_len)
+        host_len = min(
+            self._round_up_to_page_size(allocated_len),
+            req_to_host_pool.shape[1],
+        )
+        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
 
 
 def get_allocator_from_storage(allocator_type):
@@ -1099,7 +1163,7 @@ class MHATokenToKVPoolHostHCU(HostKVCache):
             raise ValueError(f"HCU HiCache Unsupported layout: {self.layout}")
         return ptr_list, element_size_list        
 
-class MLATokenToKVPoolHost(HostKVCache):
+class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
     def __init__(
@@ -1147,7 +1211,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         for registering host memory with the disaggregation transfer engine."""
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.token_stride_size] * self.layer_num
+        item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
@@ -1334,6 +1398,19 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
                     )
+                elif _is_hcu:
+                    # The all-layer table contains raw host virtual addresses.
+                    # Use the per-layer wrapper so ROCm can map each registered
+                    # host tensor through cudaHostGetDevicePointer.
+                    for layer_id in range(self.layer_num):
+                        transfer_kv_per_layer_mla(
+                            src=device_pool.kv_buffer[layer_id],
+                            dst=self.data_refs[layer_id],
+                            src_indices=device_indices,
+                            dst_indices=host_indices,
+                            item_size=self.token_stride_size,
+                            num_warps_per_block=4,
+                        )
                 else:
                     transfer_kv_all_layer_mla(
                         src_layers=device_pool.data_ptrs,
