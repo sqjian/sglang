@@ -925,6 +925,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
 
     @property
     def seqlen(self) -> int:
@@ -1282,6 +1283,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.hisparse_spec_info = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -2163,6 +2165,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
         return num_tokens
 
+    def _host_tokens_required_next_decode_spec(self, requests: List[Req]) -> int:
+        if (
+            self.hisparse_coordinator is None
+            or self.spec_algorithm.is_none()
+            or not self.hisparse_coordinator.supports_hisparse_draft_slots()
+        ):
+            return 0
+
+        server_args = get_global_server_args()
+        if self.is_spec_v2:
+            from sglang.srt.managers.utils import get_alloc_len_per_decode
+
+            max_accepted_tokens = get_alloc_len_per_decode() + 1
+        else:
+            max_accepted_tokens = (
+                max(
+                    server_args.speculative_num_steps or 0,
+                    server_args.speculative_num_draft_tokens or 0,
+                )
+                + 1
+            )
+        return max_accepted_tokens * len(requests)
+
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
         from sglang.srt.managers.utils import get_alloc_len_per_decode
@@ -2179,7 +2204,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+            return False
+
+        if self.hisparse_coordinator is None:
+            return True
+
+        requests = (
+            self.reqs
+            if selected_indices is None
+            else [self.reqs[i] for i in selected_indices]
+        )
+        host_required = self.hisparse_coordinator.host_tokens_required_next_decode(
+            requests,
+            speculative_token_budget=self._host_tokens_required_next_decode_spec(
+                requests
+            ),
+        )
+        return self.hisparse_coordinator.mem_pool_host.available_size() >= host_required
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -2210,6 +2252,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2221,11 +2264,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if self.release_req(idx, len(sorted_indices), server_args):
+                retracted_reqs.append(req)
+            else:
+                reqs_to_abort.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2260,13 +2304,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self, idx: int, remaing_req_count: int, server_args: ServerArgs
+    ) -> bool:
         req = self.reqs[idx]
+        should_retract = not isinstance(getattr(req, "to_finish", None), FINISH_ABORT)
 
         if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
+            if not should_retract:
+                self.hisparse_coordinator.request_finished(req)
+            else:
+                should_retract = self.hisparse_coordinator.retract_req(req)
+                if not should_retract:
+                    req.to_finish = FINISH_ABORT(
+                        "HiSparse preallocated host KV pool had no free slots while "
+                        "backing up the request for retract. Aborting this request "
+                        "instead of crashing the scheduler.",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.hisparse_coordinator.request_finished(req)
 
-        if server_args.disaggregation_mode == "decode":
+        if (
+            server_args.disaggregation_mode == "decode"
+            and self.hisparse_coordinator is None
+        ):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
@@ -2276,7 +2337,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
-        req.reset_for_retract()
+        if should_retract:
+            req.reset_for_retract()
+        return should_retract
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
@@ -2640,6 +2703,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
     def copy(self):
@@ -2875,3 +2939,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
