@@ -78,6 +78,13 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _uses_hisparse_device_mapping(forward_batch: ForwardBatch) -> bool:
+    translate_loc = getattr(
+        forward_batch.token_to_kv_pool, "translate_loc_to_hisparse_device", None
+    )
+    return callable(translate_loc)
+
+
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -287,7 +294,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 row_starts=ks,
             )
         else:
-            assert False, f"Unsupported {self.topk_transform_method = }"
+            assert (
+                False
+            ), f"Unsupported topk_transform_method={self.topk_transform_method}"
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
@@ -1030,17 +1039,16 @@ class NativeSparseAttnBackend(
                 page_indices, repeats=self.speculative_num_draft_tokens, dim=0
             )
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
-            extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
-
-            seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
-                ),
-                cache_seqlens,
-                self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens,
+            # Compute seqlens_expanded in-place to avoid allocations that
+            # conflict with the CUDA graph memory pool.
+            # seqlens_expanded[i*draft_tokens+j] = cache_seqlens[i] - draft_tokens + 1 + j
+            draft_tokens = self.speculative_num_draft_tokens
+            total_len = draft_tokens * bs
+            metadata.nsa_seqlens_expanded[:total_len].view(bs, draft_tokens).copy_(
+                (cache_seqlens - draft_tokens + 1).unsqueeze(1)
+                + self.get_device_int32_arange(draft_tokens).unsqueeze(0)
             )
-            metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
+            seqlens_expanded = metadata.nsa_seqlens_expanded[:total_len]
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
             )
@@ -1426,6 +1434,10 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
+        use_device_mapping_without_coordinator = (
+            forward_batch.hisparse_coordinator is None
+            and _uses_hisparse_device_mapping(forward_batch)
+        )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1450,8 +1462,48 @@ class NativeSparseAttnBackend(
                     page_size=1,
                 )
 
-        # todo hisparse: to cover more backends
         if forward_batch.hisparse_coordinator is not None:
+            if forward_batch.forward_mode.is_target_verify():
+                num_reqs = forward_batch.req_pool_indices.shape[0]
+                num_steps = self.speculative_num_draft_tokens
+                assert (
+                    topk_indices is not None
+                ), "topk_indices is None in TARGET_VERIFY/DRAFT_EXTEND_V2"
+                assert topk_indices.shape == (
+                    num_reqs * num_steps,
+                    self.nsa_index_topk,
+                ), (
+                    f"topk_indices shape mismatch: {topk_indices.shape} vs expected "
+                    f"({num_reqs * num_steps}, {self.nsa_index_topk}), "
+                    f"forward_mode={forward_batch.forward_mode}, num_reqs={num_reqs}, num_steps={num_steps}"
+                )
+                page_table_1 = (
+                    forward_batch.hisparse_coordinator.swap_in_selected_pages(
+                        forward_batch.req_pool_indices,
+                        metadata.nsa_seqlens_expanded,
+                        topk_indices.view(num_reqs, num_steps, -1),
+                        layer.layer_id,
+                        token_position_space="full",
+                        num_steps=num_steps,
+                    ).view(num_reqs * num_steps, -1)
+                )
+            elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                assert (
+                    topk_indices is not None
+                ), "topk_indices is None in DRAFT_EXTEND/DRAFT_EXTEND_V2"
+                page_table_1 = self._swap_in_hisparse_draft_extend_pages(
+                    forward_batch,
+                    metadata,
+                    topk_indices,
+                    layer.layer_id,
+                )
+            else:
+                page_table_1 = (
+                    forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        page_table_1
+                    )
+                )
+        elif use_device_mapping_without_coordinator:
             page_table_1 = (
                 forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
@@ -1609,12 +1661,17 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        use_device_mapping_without_coordinator = (
+            forward_batch.hisparse_coordinator is None
+            and _uses_hisparse_device_mapping(forward_batch)
+        )
         if forward_batch.hisparse_coordinator is not None:
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
+                token_position_space="full",
             )
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
@@ -1623,6 +1680,13 @@ class NativeSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+            )
+
+        if use_device_mapping_without_coordinator:
+            page_table_1 = (
+                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                )
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -2175,6 +2239,79 @@ class NativeSparseAttnBackend(
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
 
+    def _swap_in_hisparse_draft_extend_pages(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        topk_indices: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Swap HiSparse pages for variable-length DRAFT_EXTEND queries."""
+        assert forward_batch.hisparse_coordinator is not None
+
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_lens_cpu is None:
+            extend_lens_cpu = metadata.nsa_extend_seq_lens_list
+        extend_lens_cpu = [int(x) for x in extend_lens_cpu]
+
+        num_reqs = forward_batch.req_pool_indices.shape[0]
+        extend_lens_cpu = extend_lens_cpu[:num_reqs]
+        total_extend = sum(extend_lens_cpu)
+        if total_extend == 0:
+            return topk_indices.new_full(topk_indices.shape, -1)
+
+        max_steps = max(extend_lens_cpu)
+        if max_steps == 0:
+            return topk_indices.new_full(topk_indices.shape, -1)
+
+        real_topk = topk_indices[:total_extend]
+        padded_topk = topk_indices.new_full(
+            (num_reqs, max_steps, topk_indices.shape[-1]), -1
+        )
+        padded_seq_lens = metadata.nsa_seqlens_expanded.new_ones((num_reqs, max_steps))
+
+        offset = 0
+        for req_idx, extend_len in enumerate(extend_lens_cpu):
+            if extend_len == 0:
+                continue
+            next_offset = offset + extend_len
+            padded_topk[req_idx, :extend_len].copy_(real_topk[offset:next_offset])
+            padded_seq_lens[req_idx, :extend_len].copy_(
+                metadata.nsa_seqlens_expanded[offset:next_offset]
+            )
+            offset = next_offset
+
+        swapped = forward_batch.hisparse_coordinator.swap_in_selected_pages(
+            forward_batch.req_pool_indices,
+            padded_seq_lens.reshape(-1),
+            padded_topk,
+            layer_id,
+            token_position_space="full",
+            num_steps=max_steps,
+        )
+
+        rows = [
+            swapped[req_idx, :extend_len]
+            for req_idx, extend_len in enumerate(extend_lens_cpu)
+            if extend_len > 0
+        ]
+        page_table_1 = torch.cat(rows, dim=0)
+        if topk_indices.shape[0] > total_extend:
+            page_table_1 = torch.cat(
+                [
+                    page_table_1,
+                    topk_indices.new_full(
+                        (
+                            topk_indices.shape[0] - total_extend,
+                            topk_indices.shape[-1],
+                        ),
+                        -1,
+                    ),
+                ],
+                dim=0,
+            )
+        return page_table_1
+
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
@@ -2271,9 +2408,10 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        force_unfused = (
-            forward_batch.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+        force_unfused = forward_batch.hisparse_coordinator is not None and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
