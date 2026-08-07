@@ -442,7 +442,10 @@ class SchedulerDPAttnMixin:
             mtp_index_share_for_topk1=(
                 self.spec_algorithm.is_eagle()
                 and self.server_args.speculative_eagle_topk == 1
-                and is_mtp_index_share_enabled(self.model_config.hf_config)
+                and is_mtp_index_share_enabled(
+                    self.model_config.hf_config,
+                    enable_hisparse=self.server_args.enable_hisparse,
+                )
             ),
             scheduler_step_info=scheduler_step_info,
             sync_group_override=sync_group_override,

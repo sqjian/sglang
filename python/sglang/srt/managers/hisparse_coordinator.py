@@ -1064,7 +1064,9 @@ class HiSparseCoordinator:
     def finalize_accepted_tokens_spec_v2(
         self,
         req_pool_indices: torch.Tensor,
+        req_pool_indices_cpu: List[int],
         seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
         verify_cache_locs: torch.Tensor,
         accept_index: torch.Tensor,
     ) -> None:
@@ -1076,6 +1078,53 @@ class HiSparseCoordinator:
         """
         assert self.supports_hisparse_draft_slots()
         if verify_cache_locs.numel() == 0:
+            return
+
+        num_tokens_per_req = accept_index.shape[1]
+        seq_lens_cpu_list = seq_lens_cpu.tolist()
+        batch_size = accept_index.shape[0]
+        if (
+            len(req_pool_indices_cpu) != batch_size
+            or len(seq_lens_cpu_list) != batch_size
+        ):
+            raise ValueError(
+                "HiSparse spec-v2 CPU metadata mismatch: "
+                f"{batch_size=} {len(req_pool_indices_cpu)=} "
+                f"{len(seq_lens_cpu_list)=}."
+            )
+
+        # Short requests keep every possible accepted token in the hot buffer.
+        # The verify-slot setup has already installed their device mappings, so
+        # only rejected logical slots need clearing. Keep this path static-shape
+        # and GPU-only to avoid synchronizing target-verify through Tensor.item().
+        if all(
+            seq_len + num_tokens_per_req <= self.device_buffer_size
+            for seq_len in seq_lens_cpu_list
+        ):
+            self.clear_pending_draft_extend_backup()
+            full_to_device_mapping = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+            flat_accept_index = accept_index.reshape(-1).to(torch.int64)
+            valid_accept_index = flat_accept_index >= 0
+            accepted_slot_counts = torch.zeros(
+                verify_cache_locs.numel(),
+                dtype=torch.int32,
+                device=verify_cache_locs.device,
+            )
+            accepted_slot_counts.scatter_add_(
+                0,
+                flat_accept_index.clamp_min(0),
+                valid_accept_index.to(torch.int32),
+            )
+            verify_device_locs = full_to_device_mapping[verify_cache_locs]
+            full_to_device_mapping[verify_cache_locs] = torch.where(
+                accepted_slot_counts > 0,
+                verify_device_locs,
+                0,
+            )
+            for req_idx in req_pool_indices_cpu:
+                self._skip_first_backup[req_idx] = True
             return
 
         counts = (accept_index != -1).sum(dim=1).to(torch.int64)

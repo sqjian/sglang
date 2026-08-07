@@ -177,8 +177,17 @@ def get_num_indexer_layers(config) -> int:
     return getattr(config, "num_indexer_layers", 0)
 
 
-def is_mtp_index_share_enabled(hf_config) -> bool:
-    return getattr(hf_config, "index_share_for_mtp_iteration", False)
+def is_mtp_index_share_enabled(hf_config, *, enable_hisparse: bool = False) -> bool:
+    """Whether MTP steps may reuse one allocator-independent NSA top-k seed.
+
+    HiSparse draft attention updates its sparse mapping between MTP steps, so
+    each step must recompute top-k instead of reusing a seed captured against
+    the previous mapping.
+    """
+    return bool(
+        getattr(hf_config, "index_share_for_mtp_iteration", False)
+        and not enable_hisparse
+    )
 
 
 def get_mtp_index_share_topk(hf_config) -> int:

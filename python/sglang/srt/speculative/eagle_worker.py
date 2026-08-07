@@ -312,6 +312,15 @@ class EAGLEWorker(TpModelWorker):
 
         # Capture extend
         if self.draft_extend_attn_backend and not _is_npu:
+            if self.target_worker.model_runner.hisparse_coordinator is not None:
+                log_info_on_rank0(
+                    logger,
+                    "Skip draft extend cuda graph capture because HiSparse "
+                    "draft-extend uses variable accepted-token rows and always "
+                    "runs eagerly.",
+                )
+                return
+
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(

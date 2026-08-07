@@ -246,7 +246,13 @@ class EAGLEDraftCudaGraphRunner:
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
-        if self.enable_mtp_index_share and (
+        share_mtp_topk_indices = is_mtp_index_share_enabled(
+            self.model_runner.model_config.hf_config,
+            enable_hisparse=(
+                getattr(forward_batch, "hisparse_coordinator", None) is not None
+            ),
+        )
+        if share_mtp_topk_indices and (
             not forward_batch.forward_mode.is_idle() or self.topk != 1
         ):
             mtp_topk_indices = getattr(

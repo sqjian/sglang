@@ -348,6 +348,18 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
+        if (
+            self.draft_extend_attn_backend
+            and self.target_worker.model_runner.hisparse_coordinator is not None
+        ):
+            log_info_on_rank0(
+                logger,
+                "Skip draft extend cuda graph capture because HiSparse "
+                "draft-extend uses variable accepted-token rows and always "
+                "runs eagerly.",
+            )
+            return
+
         Device2ExtendCudaGraphRunner = {
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
@@ -524,7 +536,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Forward multiple steps
         scores = None
         index_share_for_mtp_iteration = is_mtp_index_share_enabled(
-            self.draft_runner.model_config.hf_config
+            self.draft_runner.model_config.hf_config,
+            enable_hisparse=(forward_batch.hisparse_coordinator is not None),
         )
         if index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
@@ -632,7 +645,10 @@ class EagleDraftWorker(BaseDraftWorker):
         last accepted row already used for logits and hidden states.
         """
         next_draft_input.mtp_topk_indices = None
-        if not is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
+        if not is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config,
+            enable_hisparse=(forward_batch.hisparse_coordinator is not None),
+        ):
             return
 
         topk_indices = forward_batch.topk_indices if source is None else source
@@ -709,7 +725,10 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_hidden_states_before_norm = (
             self.need_hidden_states_before_norm
         )
-        if is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
+        if is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config,
+            enable_hisparse=(forward_batch.hisparse_coordinator is not None),
+        ):
             forward_batch.capture_mtp_topk_indices = True
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
@@ -764,7 +783,10 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.spec_info.num_correct_drafts = batch_result.accept_lens - 1
             forward_batch.spec_info.num_accept_tokens = batch_result.accept_lens
 
-        if is_mtp_index_share_enabled(self.draft_runner.model_config.hf_config):
+        if is_mtp_index_share_enabled(
+            self.draft_runner.model_config.hf_config,
+            enable_hisparse=(forward_batch.hisparse_coordinator is not None),
+        ):
             forward_batch.capture_mtp_topk_indices = True
 
         # Run draft extend batch in the main compute stream
@@ -1267,7 +1289,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             hisparse_coordinator.finalize_accepted_tokens_spec_v2(
                 req_pool_indices=batch.req_pool_indices,
+                req_pool_indices_cpu=[req.req_pool_idx for req in batch.reqs],
                 seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
                 verify_cache_locs=batch.out_cache_loc,
                 accept_index=accept_index,
             )

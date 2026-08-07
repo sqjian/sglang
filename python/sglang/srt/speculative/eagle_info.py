@@ -1060,6 +1060,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             hidden_states=_slice_optional_tensor(self.hidden_states, sli),
             capture_hidden_mode=self.capture_hidden_mode,
             bonus_tokens=_slice_optional_tensor(self.bonus_tokens, sli),
+            mtp_topk_indices=_slice_optional_tensor(self.mtp_topk_indices, sli),
             future_indices=future_indices,
             new_seq_lens=_slice_optional_tensor(self.new_seq_lens, sli),
             verify_done=self.verify_done,
