@@ -323,16 +323,6 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
             hisparse_coordinator = batch.hisparse_coordinator
-            if (
-                hisparse_coordinator is not None
-                and hisparse_coordinator.supports_hisparse_draft_slots()
-            ):
-                hisparse_coordinator.prepare_verify_slots_spec_v2(
-                    req_pool_indices=batch.req_pool_indices,
-                    verify_cache_locs=batch.out_cache_loc,
-                    num_tokens_per_req=self.draft_token_num,
-                    start_positions_cpu=batch.seq_lens_cpu,
-                )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -371,6 +361,18 @@ class EagleVerifyInputV2Mixin:
                     batch.out_cache_loc,
                     req_to_token_pool.req_to_token.shape[1],
                     next_power_of_2(bs),
+                )
+            if (
+                hisparse_coordinator is not None
+                and hisparse_coordinator.supports_hisparse_draft_slots()
+            ):
+                # Both assignment paths fill the preallocated tensor in place.
+                # Do not use it as a mapping index until that write is queued.
+                hisparse_coordinator.prepare_verify_slots_spec_v2(
+                    req_pool_indices=batch.req_pool_indices,
+                    verify_cache_locs=batch.out_cache_loc,
+                    num_tokens_per_req=self.draft_token_num,
+                    start_positions_cpu=batch.seq_lens_cpu,
                 )
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
