@@ -996,6 +996,15 @@ class SchedulerMetricsMixin:
         include_all = "all" in include
 
         num_running_reqs = len(self.running_batch.reqs)
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.chunked_req is not None
+            and all(req is not self.chunked_req for req in self.running_batch.reqs)
+        ):
+            # Chunked Prefill deliberately stashes the current request outside
+            # running_batch, but it is still active and must be visible to
+            # /v1/loads consumers.
+            num_running_reqs += 1
 
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
