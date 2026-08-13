@@ -61,6 +61,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadsReqOutput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -366,6 +367,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state: Dict[str, ReqState] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
+        self.scheduler_load_cache: Dict[int, GetLoadsReqOutput] = {}
 
         # Health check
         self.server_status = ServerStatus.Starting
@@ -1898,12 +1900,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
         # BatchTokenIDOutput.
         if (
-            self.server_args.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+            isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
             and recv_obj.load is not None
         ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+            self.scheduler_load_cache[recv_obj.load.dp_rank] = recv_obj.load
+            if self.server_args.dp_size > 1:
+                load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+                self.send_to_scheduler.send_pyobj(load_update_req)
 
     def add_logprob_to_meta_info(
         self,

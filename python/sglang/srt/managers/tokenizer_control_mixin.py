@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
@@ -87,6 +88,13 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def complete_cached_loads(loads_by_rank: Dict[int, Any], dp_size: int) -> Optional[List[Any]]:
+    """Return an isolated, rank-ordered cache only when every DP rank is present."""
+    if sorted(loads_by_rank) != list(range(dp_size)):
+        return None
+    return copy.deepcopy([loads_by_rank[rank] for rank in range(dp_size)])
 
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
@@ -821,10 +829,15 @@ class TokenizerControlMixin:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        # Always request all sections from scheduler — watching mode shares
-        # results across concurrent callers, so we fetch full data and filter here.
-        req = GetLoadsReqInput(include=["all"], dp_rank=None)
-        results = await self.get_loads_communicator(req)
+        # Scheduler output continuously refreshes this cache. Reading it avoids
+        # blocking /v1/loads on the slowest DP rank during long decode steps.
+        results = complete_cached_loads(self.scheduler_load_cache, self.server_args.dp_size)
+        if results is None:
+            # Preserve the original fan-out path for startup and incomplete
+            # caches, and seed the cache with a complete full-section response.
+            req = GetLoadsReqInput(include=["all"], dp_rank=None)
+            results = await self.get_loads_communicator(req)
+            self.scheduler_load_cache.update({result.dp_rank: result for result in results})
 
         # Filter by dp_rank if specified
         if dp_rank is not None:

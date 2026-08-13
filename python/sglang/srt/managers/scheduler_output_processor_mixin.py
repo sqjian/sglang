@@ -1092,7 +1092,9 @@ class SchedulerOutputProcessorMixin:
         spec_correct_drafts_histogram = []
         retraction_counts = []
         output_hidden_states = None
-        load = self.get_loads(GetLoadsReqInput(include=["core"]))
+        # TokenizerManager caches these outputs for non-blocking /v1/loads
+        # reads, so retain every section required by observability consumers.
+        load = self.get_loads(GetLoadsReqInput(include=["all"]))
         routed_experts = None
         indexer_topk = None
         customized_info = {}
