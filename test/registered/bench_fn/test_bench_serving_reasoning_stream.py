@@ -168,6 +168,14 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
 
+    def test_empty_usage_only_stream_is_not_reported_as_success(self):
+        out = self._run(
+            [{"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}]
+        )
+
+        self.assertFalse(out.success)
+        self.assertEqual(out.error, "stream_completed_without_content_or_finish_reason")
+
     def test_content_only_stream_unchanged(self):
         chunks = [
             _make_chunk(content="hi "),

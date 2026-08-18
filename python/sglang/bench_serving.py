@@ -28,7 +28,7 @@ import warnings
 from argparse import ArgumentParser
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
@@ -46,8 +46,31 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import NetworkAddress
+try:
+    from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+    from sglang.srt.utils.network import NetworkAddress
+except ModuleNotFoundError:
+    # Client-only benchmark environments do not need the GPU runtime imported by
+    # sglang.srt. Keep the two tiny address helpers local for offline evaluation.
+    FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+    @dataclass(frozen=True)
+    class NetworkAddress:
+        host: str
+        port: int
+
+        def __post_init__(self):
+            if self.host.startswith("[") and self.host.endswith("]"):
+                object.__setattr__(self, "host", self.host[1:-1])
+
+        def _wrapped_host(self) -> str:
+            return f"[{self.host}]" if ":" in self.host else self.host
+
+        def to_url(self, scheme: str = "http") -> str:
+            return f"{scheme}://{self._wrapped_host()}:{self.port}"
+
+        def to_host_port_str(self) -> str:
+            return f"{self._wrapped_host()}:{self.port}"
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -104,6 +127,8 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    server_prompt_len: Optional[int] = None
+    finish_reason: Optional[str] = None
     start_time: float = 0.0
 
     @staticmethod
@@ -400,6 +425,7 @@ async def async_request_openai_chat_completions(
             "messages": messages,
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
+            "stream_options": {"include_usage": True},
         }
 
         # Add temperature default only if not specified in extra_request_body
@@ -451,6 +477,12 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        output.server_prompt_len = response_json.get("usage", {}).get(
+                            "prompt_tokens"
+                        )
+                        output.finish_reason = response_json["choices"][0].get(
+                            "finish_reason"
+                        )
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -469,10 +501,17 @@ async def async_request_openai_chat_completions(
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
+                                server_prompt_len = (data.get("usage") or {}).get(
+                                    "prompt_tokens"
+                                )
+                                if server_prompt_len is not None:
+                                    output.server_prompt_len = server_prompt_len
 
                                 choices = data.get("choices") or []
                                 if not choices:
                                     continue
+                                if choices[0].get("finish_reason") is not None:
+                                    output.finish_reason = choices[0]["finish_reason"]
 
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
@@ -499,7 +538,11 @@ async def async_request_openai_chat_completions(
                                     generated_text += content
 
                         output.generated_text = generated_text
-                        output.success = True
+                        if not generated_text and output.finish_reason is None:
+                            output.success = False
+                            output.error = "stream_completed_without_content_or_finish_reason"
+                        else:
+                            output.success = True
                         output.latency = latency
                         output.output_len = output_len
                 else:
@@ -1349,6 +1392,7 @@ async def benchmark(
                 print("Profiler started")
 
     # Run all requests
+    benchmark_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
@@ -1462,6 +1506,7 @@ async def benchmark(
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    benchmark_ended_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else input_requests,
         outputs=outputs,
@@ -1597,6 +1642,8 @@ async def benchmark(
             "random_range_ratio": args.random_range_ratio,
             # Information
             "server_info": server_info,
+            "started_at": benchmark_started_at,
+            "ended_at": benchmark_ended_at,
             # Results
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -1656,9 +1703,13 @@ async def benchmark(
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
+        "server_prompt_lens": [output.server_prompt_len for output in outputs],
         "output_lens": output_lens,
+        "successes": [output.success for output in outputs],
+        "latencies": [output.latency for output in outputs],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
+        "finish_reasons": [output.finish_reason for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
@@ -1853,7 +1904,9 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend != "sglang-embedding" and not check_chat_template(args.model):
+    if args.backend != "sglang-embedding" and not check_chat_template(
+        args.tokenizer or args.model
+    ):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
