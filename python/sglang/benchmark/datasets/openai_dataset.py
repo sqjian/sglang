@@ -1,12 +1,17 @@
+import copy
 import json
 from argparse import Namespace
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
+from sglang.srt.entrypoints.openai.chat_message_utils import (
+    normalize_assistant_tool_call_arguments,
+    normalize_tool_content,
+)
 
 
 @dataclass
@@ -14,13 +19,21 @@ class OpenAIDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
+    extra_request_body: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_args(cls, args: Namespace) -> "OpenAIDataset":
+        raw_extra_request_body = getattr(args, "extra_request_body", None)
+        extra_request_body = (
+            json.loads(raw_extra_request_body) if raw_extra_request_body else {}
+        )
+        if not isinstance(extra_request_body, dict):
+            raise ValueError("--extra-request-body must be a JSON object")
         return cls(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
+            extra_request_body=extra_request_body,
         )
 
     def load(
@@ -31,7 +44,82 @@ class OpenAIDataset(BaseDataset):
             num_requests=self.num_requests,
             tokenizer=tokenizer,
             fixed_output_len=self.fixed_output_len,
+            extra_request_body=self.extra_request_body,
         )
+
+
+def _normalize_messages_for_tokenizer(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized_messages = copy.deepcopy(messages)
+    for message in normalized_messages:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ValueError("OpenAI dataset message must contain a string role")
+        if message.get("content") is None:
+            message["content"] = ""
+        message["content"] = normalize_tool_content(
+            message["role"], message.get("content")
+        )
+        normalize_assistant_tool_call_arguments(message)
+    return normalized_messages
+
+
+def _effective_request_body(
+    record_body: Dict[str, Any], global_body: Dict[str, Any]
+) -> Dict[str, Any]:
+    # Match benchmark(): per-request dataset fields override global CLI fields.
+    return {**copy.deepcopy(global_body), **copy.deepcopy(record_body)}
+
+
+def _render_prompt(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]],
+    template_kwargs: Dict[str, Any],
+) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            return_dict=False,
+            **template_kwargs,
+        )
+    except Exception:
+        if not tools:
+            raise
+        flat_tools = [tool.get("function", tool) for tool in tools]
+        return tokenizer.apply_chat_template(
+            messages,
+            tools=flat_tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            return_dict=False,
+            **template_kwargs,
+        )
+
+
+def _count_prompt_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: List[Dict[str, Any]],
+    extra_body: Dict[str, Any],
+) -> int:
+    normalized_messages = _normalize_messages_for_tokenizer(messages)
+    template_kwargs = copy.deepcopy(extra_body.get("chat_template_kwargs", {}))
+    if not isinstance(template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    tools = copy.deepcopy(extra_body.get("tools"))
+    if tools is not None and not isinstance(tools, list):
+        raise ValueError("tools must be an array")
+
+    rendered_prompt = _render_prompt(
+        tokenizer=tokenizer,
+        messages=normalized_messages,
+        tools=tools,
+        template_kwargs=template_kwargs,
+    )
+    return len(tokenizer.encode(rendered_prompt, add_special_tokens=False))
 
 
 def sample_openai_requests(
@@ -39,6 +127,7 @@ def sample_openai_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    extra_request_body: Optional[Dict[str, Any]] = None,
 ) -> List[DatasetRow]:
     """
     Load OpenAI-compatible chat completion requests from a JSONL file.
@@ -51,6 +140,10 @@ def sample_openai_requests(
     - "top_p": optional top_p value
     - Other OpenAI API parameters are also extracted and passed through
     """
+    global_body = {} if extra_request_body is None else extra_request_body
+    if not isinstance(global_body, dict):
+        raise ValueError("extra_request_body must be an object")
+
     dataset = []
     with open(dataset_path, "r") as f:
         for line in f:
@@ -80,22 +173,8 @@ def sample_openai_requests(
 
         # Extract extra request body parameters (tools, temperature, top_p, etc.)
         extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
-
-        # Calculate prompt length by applying chat template
-        # This includes the messages but not the tools
-        prompt_len = len(
-            tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-        )
-
-        # If tools are present, we need to add their token count
-        # Tools are sent as part of the request and count toward input tokens
-        if "tools" in extra_body:
-            # Encode tools as JSON string to estimate token count
-            tools_str = json.dumps(extra_body["tools"])
-            tools_tokens = len(tokenizer.encode(tools_str))
-            prompt_len += tools_tokens
+        effective_body = _effective_request_body(extra_body, global_body)
+        prompt_len = _count_prompt_tokens(tokenizer, messages, effective_body)
 
         # Pass messages list directly - the serving benchmark handles List[Dict] prompts
         filtered_dataset.append(

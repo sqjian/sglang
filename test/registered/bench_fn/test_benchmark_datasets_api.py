@@ -516,6 +516,157 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
+        expected_prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "What is 1+1?"}],
+            tokenize=False,
+            add_generation_prompt=True,
+            return_dict=False,
+        )
+        expected_prompt_len = len(
+            self.tokenizer.encode(expected_prompt, add_special_tokens=False)
+        )
+        self.assertEqual(rows[0].prompt_len, expected_prompt_len)
+
+    def test_openai_sampler_normalizes_tool_calls_for_prompt_counting(self):
+        tokenizer = create_lightweight_tokenizer()
+        tokenizer.chat_template = (
+            "{% if enable_thinking %}thinking\\n{% endif %}"
+            "{% for tool in tools %}tool={{ tool['function']['name'] }}\\n{% endfor %}"
+            "{% for message in messages %}"
+            "{{ message['role'] }}:"
+            "{% if message['role'] == 'assistant' and message.get('tool_calls') %}"
+            "{% for tool_call in message['tool_calls'] %}"
+            "{% for key, value in tool_call['function']['arguments'].items() %}"
+            "{{ key }}={{ value }}"
+            "{% endfor %}"
+            "{% endfor %}"
+            "{% else %}{{ message['content'] }}{% endif %}\\n"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}assistant:{% endif %}"
+        )
+        messages = [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city":"Beijing"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "sunny"},
+                    {"type": "text", "text": "now"},
+                ],
+            },
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        record = {
+            "messages": messages,
+            "max_tokens": 8,
+            "tools": tools,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        dataset_path = self.tmpdir_path / "openai_tools.jsonl"
+        with open(dataset_path, "w") as f:
+            f.write(json.dumps(record) + "\n")
+
+        rows = sample_openai_requests(
+            dataset_path=str(dataset_path),
+            num_requests=1,
+            tokenizer=tokenizer,
+            fixed_output_len=16,
+            extra_request_body={"chat_template_kwargs": {"enable_thinking": True}},
+        )
+
+        normalized_messages = [
+            {"role": "user", "content": "weather"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "Beijing"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "sunny now"},
+        ]
+        expected_prompt = tokenizer.apply_chat_template(
+            normalized_messages,
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=True,
+            return_dict=False,
+            enable_thinking=False,
+        )
+        expected_prompt_len = len(
+            tokenizer.encode(expected_prompt, add_special_tokens=False)
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].prompt_len, expected_prompt_len)
+        self.assertGreater(rows[0].prompt_len, 2)
+        self.assertEqual(rows[0].output_len, 16)
+        self.assertEqual(rows[0].extra_request_body["tools"], tools)
+        self.assertIsInstance(
+            rows[0].prompt[1]["tool_calls"][0]["function"]["arguments"], str
+        )
+        self.assertIsInstance(rows[0].prompt[2]["content"], list)
+
+    def test_openai_sampler_rejects_invalid_tool_call_arguments(self):
+        invalid_arguments = [
+            ("not-json", "valid JSON"),
+            ("[]", "JSON object"),
+        ]
+        for index, (arguments, expected_error) in enumerate(invalid_arguments):
+            with self.subTest(arguments=arguments):
+                record = {
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "tool_a",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                }
+                dataset_path = self.tmpdir_path / f"openai_invalid_{index}.jsonl"
+                with open(dataset_path, "w") as f:
+                    f.write(json.dumps(record) + "\n")
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    sample_openai_requests(
+                        dataset_path=str(dataset_path),
+                        num_requests=1,
+                        tokenizer=self.tokenizer,
+                    )
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)

@@ -37,6 +37,10 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai.chat_message_utils import (
+    normalize_assistant_tool_call_arguments,
+    normalize_tool_content,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -96,66 +100,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
-
-
-def normalize_tool_content(role: str, content):
-    """Normalize tool message content from OpenAI array format to plain string.
-
-    OpenAI clients may send tool content as a list of content parts
-    (e.g. [{"type":"text","text":"..."}]) but most chat templates expect
-    a plain string for tool messages. Only flatten when ALL items are
-    pure OpenAI text parts; preserve lists containing non-text-type items
-    that some templates intentionally iterate over.
-    """
-    if role != "tool" or not isinstance(content, list):
-        return content
-    parts = content
-    is_openai_text_parts = all(
-        (isinstance(p, dict) and p.get("type") == "text") or isinstance(p, str)
-        for p in parts
-    )
-    if is_openai_text_parts:
-        text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
-        return " ".join(text_parts)
-    return content
-
-
-def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
-    """Parse OpenAI tool call arguments for chat templates."""
-    try:
-        parsed_arguments = orjson.loads(arguments)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(
-            "Assistant tool call function.arguments must be valid JSON."
-        ) from exc
-
-    if not isinstance(parsed_arguments, dict):
-        raise ValueError(
-            "Assistant tool call function.arguments must be a JSON object."
-        )
-
-    return parsed_arguments
-
-
-def normalize_assistant_tool_call_arguments(
-    message: Dict[str, Any], *, strict: bool = True
-) -> None:
-    """Normalize assistant history tool call arguments in-place."""
-    if message.get("role") != "assistant" or not isinstance(
-        message.get("tool_calls"), list
-    ):
-        return
-
-    for item in message["tool_calls"]:
-        function = item.get("function") if isinstance(item, dict) else None
-        if not isinstance(function, dict):
-            continue
-        if "arguments" in function and isinstance(function["arguments"], str):
-            try:
-                function["arguments"] = parse_tool_call_arguments(function["arguments"])
-            except ValueError:
-                if strict:
-                    raise
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
