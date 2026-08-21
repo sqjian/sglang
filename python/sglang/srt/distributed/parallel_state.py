@@ -445,9 +445,9 @@ class GroupCoordinator:
 
             # doc §6.5: QuickAllReduce is IPC-only. When aiter is going to run
             # over Fabric/auto, don't let QR construct alongside it.
-            suppress_qr = (
-                ca_backend in ("aiter", "auto")
-                and aiter_transport_env in ("fabric", "auto")
+            suppress_qr = ca_backend in ("aiter", "auto") and aiter_transport_env in (
+                "fabric",
+                "auto",
             )
             if is_hip() and use_quick_custom_allreduce and not suppress_qr:
                 try:
@@ -867,7 +867,9 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            with pynccl_comm.change_state(enable=True, stream=get_current_device_stream_fast()):
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
                 pynccl_comm.all_to_all_single(output, input)
         else:
             torch.distributed.all_to_all_single(output, input, group=self.device_group)
@@ -1605,9 +1607,13 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
-            if use_pynccl is None
-            else use_pynccl
+            False
+            if envs.SGLANG_DISABLE_PYNCCL.get()
+            else (
+                not (_is_npu or _is_xpu or backend == "mooncake")
+                if use_pynccl is None
+                else use_pynccl
+            )
         ),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
@@ -1690,6 +1696,34 @@ _PP: Optional[GroupCoordinator] = None
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def prewarm_pp_p2p() -> None:
+    """Eagerly create NCCL communicators between adjacent PP stages.
+
+    PP tensor transfers use unbatched send/recv, which lazily creates a
+    dedicated two-rank communicator for each adjacent stage pair. Establish
+    those communicators before the KV memory pool claims the remaining device
+    memory.
+    """
+    pp_group = get_pp_group()
+    dummy = torch.zeros(1, device=pp_group.device)
+
+    # A receive-then-send chain lets every pair initialize without deadlock.
+    if not pp_group.is_first_rank:
+        torch.distributed.recv(
+            dummy,
+            src=pp_group.ranks[pp_group.rank_in_group - 1],
+            group=pp_group.device_group,
+        )
+    if not pp_group.is_last_rank:
+        torch.distributed.send(
+            dummy,
+            dst=pp_group.ranks[pp_group.rank_in_group + 1],
+            group=pp_group.device_group,
+        )
+
+    torch.get_device_module().synchronize()
 
 
 # kept for backward compatibility

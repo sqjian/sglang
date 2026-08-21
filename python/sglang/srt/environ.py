@@ -300,6 +300,7 @@ class Envs:
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
 
     # Model Parallel
+    SGLANG_DISABLE_PYNCCL = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Override the distributed init method used by torch.distributed.init_process_group.

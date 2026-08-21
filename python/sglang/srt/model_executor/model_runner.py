@@ -80,6 +80,7 @@ from sglang.srt.distributed import (
     get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
+    prewarm_pp_p2p,
     set_custom_all_reduce,
     set_custom_all_reduce_backend,
     set_mscclpp_all_reduce,
@@ -1319,6 +1320,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
+
+            if self.pp_size > 1:
+                warmup_start = time.perf_counter()
+                prewarm_pp_p2p()
+                logger.info(
+                    "PP P2P communicator warmup completed in "
+                    f"{time.perf_counter() - warmup_start:.3f}s"
+                )
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
