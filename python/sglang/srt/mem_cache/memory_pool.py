@@ -4508,6 +4508,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+            parallel = get_parallel()
+            if parallel.dcp_enabled:
+                # Latent KV is sharded by global_slot % dcp_size, while the DSA
+                # indexer must retain global slots on every rank so all ranks
+                # produce the same top-k selection.
+                index_buf_size *= parallel.attn_dcp_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128

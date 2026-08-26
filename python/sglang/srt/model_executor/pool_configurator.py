@@ -84,6 +84,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_dsa_indexer_cache_token_multiplier(kvc: KVCacheConfigurator) -> int:
+    """Return indexer-cache slots allocated per allocator-visible token."""
+    memory_config = get_memory()
+    if memory_config.enable_hisparse:
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        return parse_hisparse_config(kvc.server_args).host_to_device_ratio
+
+    parallel = get_parallel()
+    return parallel.attn_dcp_size if parallel.dcp_enabled else 1
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds to the target's budget, 0 if none.
 
@@ -364,12 +376,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         element_size = torch._utils._element_size(
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
-        memory_config = get_memory()
-        indexer_ratio = 1
-        if memory_config.enable_hisparse:
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+        indexer_ratio = _get_dsa_indexer_cache_token_multiplier(kvc)
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
