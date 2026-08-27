@@ -1645,10 +1645,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return
 
         if self._use_hcu_bf16_index_cache(pool):
+            # The unfused indexer produces one 128-wide key per token, while
+            # the plain cache keeps an explicit single-head dimension.
+            index_k = key.unsqueeze(-2) if key.ndim == 2 else key
             pool.set_index_k_buffer(
                 layer_id=layer_id,
                 loc=out_cache_loc,
-                index_k=key,
+                index_k=index_k,
             )
             return
 

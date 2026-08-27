@@ -96,7 +96,7 @@ class TestDSAHCUCacheContract(unittest.TestCase):
 
     def test_hcu_bf16_store_uses_plain_index_cache(self):
         indexer = object.__new__(Indexer)
-        key = torch.randn(2, 1, 128, dtype=torch.bfloat16)
+        key = torch.randn(2, 128, dtype=torch.bfloat16)
         out_cache_loc = torch.tensor([64, 65], dtype=torch.int64)
         forward_batch = MagicMock(out_cache_loc=out_cache_loc)
         pool = MagicMock(use_fp8_index_k_cache=False, page_size=64)
@@ -115,7 +115,7 @@ class TestDSAHCUCacheContract(unittest.TestCase):
         pool.set_index_k_buffer.assert_called_once_with(
             layer_id=3,
             loc=out_cache_loc,
-            index_k=key,
+            index_k=key.unsqueeze(1),
         )
         pool.set_index_k_scale_buffer.assert_not_called()
 
