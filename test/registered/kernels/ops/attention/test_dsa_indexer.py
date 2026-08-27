@@ -13,6 +13,9 @@ _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.dsa import dsa_indexer as dsa_indexer_module
+from sglang.srt.layers.attention.dsa import (
+    paged_mqa_logits_backend as paged_mqa_logits_backend_module,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
@@ -56,6 +59,79 @@ DEFAULT_CONFIG = {
     "layer_id": 0,
     "page_size": 64,
 }
+
+
+class TestDSAHCUCacheContract(unittest.TestCase):
+    def test_hcu_auto_paged_mqa_backend_uses_lightop(self):
+        with (
+            patch.object(
+                paged_mqa_logits_backend_module,
+                "is_hcu",
+                return_value=True,
+                create=True,
+            ),
+            patch.object(paged_mqa_logits_backend_module, "is_hip", return_value=True),
+        ):
+            backend = paged_mqa_logits_backend_module.DSAPagedMQALogitsBackend.resolve(
+                "auto"
+            )
+
+        self.assertEqual(
+            backend,
+            paged_mqa_logits_backend_module.DSAPagedMQALogitsBackend.LIGHTOP,
+        )
+
+    def test_hcu_bf16_cache_detection(self):
+        indexer = object.__new__(Indexer)
+
+        with patch.object(dsa_indexer_module, "_is_hcu", True):
+            self.assertTrue(
+                indexer._use_hcu_bf16_index_cache(
+                    MagicMock(use_fp8_index_k_cache=False)
+                )
+            )
+            self.assertFalse(
+                indexer._use_hcu_bf16_index_cache(MagicMock(use_fp8_index_k_cache=True))
+            )
+
+    def test_hcu_bf16_store_uses_plain_index_cache(self):
+        indexer = object.__new__(Indexer)
+        key = torch.randn(2, 1, 128, dtype=torch.bfloat16)
+        out_cache_loc = torch.tensor([64, 65], dtype=torch.int64)
+        forward_batch = MagicMock(out_cache_loc=out_cache_loc)
+        pool = MagicMock(use_fp8_index_k_cache=False, page_size=64)
+        pool._is_layer_owned.return_value = True
+
+        with (
+            patch.object(dsa_indexer_module, "_is_hcu", True),
+            patch.object(dsa_indexer_module, "get_token_to_kv_pool", return_value=pool),
+        ):
+            indexer._store_index_k_cache(
+                forward_batch=forward_batch,
+                layer_id=3,
+                key=key,
+            )
+
+        pool.set_index_k_buffer.assert_called_once_with(
+            layer_id=3,
+            loc=out_cache_loc,
+            index_k=key,
+        )
+        pool.set_index_k_scale_buffer.assert_not_called()
+
+    def test_hcu_bf16_paged_read_uses_plain_index_cache(self):
+        indexer = object.__new__(Indexer)
+        bf16_cache = torch.randn(2, 64, 1, 128, dtype=torch.bfloat16)
+        pool = MagicMock(use_fp8_index_k_cache=False)
+        pool.get_index_k_buffer.return_value = bf16_cache
+
+        with patch.object(dsa_indexer_module, "_is_hcu", True):
+            cache, use_bf16 = indexer._get_hcu_paged_index_k_cache(pool, layer_id=7)
+
+        self.assertIs(cache, bf16_cache)
+        self.assertTrue(use_bf16)
+        pool.get_index_k_buffer.assert_called_once_with(layer_id=7)
+        pool.get_index_k_with_scale_buffer.assert_not_called()
 
 
 class MockIndexerMetadata(BaseIndexerMetadata):
