@@ -121,12 +121,18 @@ from deepgemm import (
     m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_contiguous,
     m_grouped_i8_gemm_nt_masked,
-    m_grouped_w4a8_gemm_nt_contiguous_hipc,
     m_grouped_w4a8_gemm_nt_masked,
     m_grouped_w4a8_gemm_nt_masked_hipc,
 )
+
+try:
+    from deepgemm import m_grouped_w4a8_gemm_nt_contiguous_hipc
+except ImportError:
+    m_grouped_w4a8_gemm_nt_contiguous_hipc = None
+
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
-from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
+from lightop import fuse_silu_mul_clamp_quant
+from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -143,9 +149,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
-_use_w4a8_contiguous_hipc = get_bool_env_var(
-    "SGLANG_USE_W4A8_CONTIGUOUS_HIPC"
-)
+_use_w4a8_contiguous_hipc = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")
+if _use_w4a8_contiguous_hipc and m_grouped_w4a8_gemm_nt_contiguous_hipc is None:
+    raise RuntimeError(
+        "SGLANG_USE_W4A8_CONTIGUOUS_HIPC requires deepgemm to export "
+        "m_grouped_w4a8_gemm_nt_contiguous_hipc"
+    )
 _use_lightop_ep_moe_align = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_MOE_ALIGN", "true")
 _use_lightop_ep_scatter = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_SCATTER", "true")
 _use_lightop_ep_gather = get_bool_env_var("SGLANG_USE_LIGHTOP_EP_GATHER", "true")
@@ -489,18 +498,10 @@ def _fuse_situ_mul_quant_contiguous_kernel(
     mask = offsets < hidden
     row_input = input_ptr + row * (2 * hidden)
     gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(tl.float32)
     gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
     up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
-    activated = (
-        situ_beta
-        * gate_tanh
-        * tl.sigmoid(gate)
-        * situ_linear_beta
-        * up_tanh
-    )
+    activated = situ_beta * gate_tanh * tl.sigmoid(gate) * situ_linear_beta * up_tanh
     amax = tl.max(tl.abs(activated), axis=0)
     scale = tl.where(amax > 0.0, amax / 127.0, 1.0)
     quantized = libdevice.rint(activated / scale)
@@ -522,9 +523,7 @@ def fuse_situ_mul_quant_contiguous(
         raise ValueError("SiTU beta and linear_beta must be positive")
     tokens, doubled_hidden = input.shape
     hidden = doubled_hidden // 2
-    output = torch.empty(
-        (tokens, hidden), dtype=torch.int8, device=input.device
-    )
+    output = torch.empty((tokens, hidden), dtype=torch.int8, device=input.device)
     scales = torch.empty((tokens, 1), dtype=torch.float32, device=input.device)
     _fuse_situ_mul_quant_contiguous_kernel[(tokens,)](
         input,
@@ -558,21 +557,13 @@ def _fuse_situ_mul_quant_ep_kernel(
     mask = (offsets < hidden) & valid_row
     row_input = input_ptr + row * (2 * hidden)
     gate = tl.load(row_input + offsets, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    up = tl.load(row_input + hidden + offsets, mask=mask, other=0.0).to(tl.float32)
 
     # SiTU / SoftCap-GLU used by Kimi K3. Express tanh via sigmoid because
     # that is supported consistently by the CUDA and HIP Triton backends.
     gate_tanh = 2.0 * tl.sigmoid(2.0 * gate / situ_beta) - 1.0
     up_tanh = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
-    activated = (
-        situ_beta
-        * gate_tanh
-        * tl.sigmoid(gate)
-        * situ_linear_beta
-        * up_tanh
-    )
+    activated = situ_beta * gate_tanh * tl.sigmoid(gate) * situ_linear_beta * up_tanh
 
     amax = tl.max(tl.abs(activated), axis=0)
     # A scale of one gives an exact, finite representation for an all-zero or
@@ -603,9 +594,7 @@ def fuse_situ_mul_quant_ep(
     output = torch.empty(
         (experts, tokens, hidden), dtype=torch.int8, device=input.device
     )
-    scales = torch.empty(
-        (experts, tokens, 1), dtype=torch.float32, device=input.device
-    )
+    scales = torch.empty((experts, tokens, 1), dtype=torch.float32, device=input.device)
     _fuse_situ_mul_quant_ep_kernel[(experts * tokens,)](
         input,
         output,
@@ -630,9 +619,7 @@ def fuse_situ_mul_quant_ep_fake(
     output = torch.empty(
         (experts, tokens, doubled_hidden // 2), dtype=torch.int8, device=input.device
     )
-    scales = torch.empty(
-        (experts, tokens, 1), dtype=torch.float32, device=input.device
-    )
+    scales = torch.empty((experts, tokens, 1), dtype=torch.float32, device=input.device)
     return output, scales
 
 
@@ -2113,9 +2100,7 @@ class DeepEPMoE(FusedMoE):
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             self, "down_gemm_overlap_args", None
         )
-        meta_overlap_args: Optional[dict] = getattr(
-            self, "meta_overlap_args", None
-        )
+        meta_overlap_args: Optional[dict] = getattr(self, "meta_overlap_args", None)
         assert self.moe_runner_config.activation == "silu"
         # base shapes
         num_groups, m, k = hidden_states.size()
