@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_mps,
     is_musa,
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -422,6 +424,22 @@ class RotaryEmbedding(BaseFusedOp):
                 assert (
                     fused_set_kv_buffer_arg is None
                 ), "save kv cache is not supported for fallback_rotary_embedding."
+
+                num_tokens = positions.numel()
+                is_hcu_dsa_decode_shape = (
+                    _is_hcu
+                    and self.head_size == 64
+                    and num_tokens > 0
+                    and query.numel() == num_tokens * 8 * self.head_size
+                    and key.numel() == num_tokens * self.head_size
+                )
+                if is_hcu_dsa_decode_shape:
+                    # The BW1000 sgl-kernel wheel limits this kernel to 256
+                    # threads, while the DSA TP8 decode shape launches 8 * 64
+                    # = 512 threads. Keep the fused Prefill path above and use
+                    # the numerically equivalent native path for Decode only.
+                    return self.forward_native(positions, query, key, offsets)
+
                 self.cos_sin_cache = self.cos_sin_cache.to(
                     query.device, dtype=query.dtype
                 )
