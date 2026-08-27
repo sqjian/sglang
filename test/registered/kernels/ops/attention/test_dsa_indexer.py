@@ -12,6 +12,7 @@ _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.dsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
@@ -952,6 +953,22 @@ class TestDSAIndexer(CustomTestCase):
             self.assertEqual(output.dtype, torch.bfloat16)
         except Exception:
             self.skipTest("hadamard JIT kernel not available")
+
+    def test_rotate_activation_uses_hcu_kernel(self):
+        x = torch.randn(2, 128, dtype=torch.bfloat16, device=self.device)
+
+        with (
+            patch.object(dsa_indexer_module, "_is_hcu", True),
+            patch.object(
+                dsa_indexer_module,
+                "hadamard_transform_optimized",
+                return_value=x,
+            ) as hcu_hadamard,
+        ):
+            output = rotate_activation(x)
+
+        self.assertIs(output, x)
+        hcu_hadamard.assert_called_once_with(x, scale=128**-0.5)
 
     def test_rotate_activation_invalid_size(self):
         """Test that rotate_activation fails with non-power-of-2 size."""

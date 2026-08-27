@@ -70,6 +70,11 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+if _is_hcu:
+    from sglang.kernels.ops.attention.dsa.triton_kernel import (
+        hadamard_transform_optimized,
+    )
+
 if not _is_npu:
     from sglang.kernels.ops.attention.dsa import (
         aiter_paged_mqa_logits,
@@ -185,11 +190,13 @@ def _broadcast_indexer_topk_from_rank0(
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
-    if _is_hip:
+    if _is_hcu:
+        hadamard_transform = hadamard_transform_optimized
+    elif _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_xpu:
         from sgl_kernel import hadamard_transform
-    elif not _is_hcu:
+    else:
         from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
