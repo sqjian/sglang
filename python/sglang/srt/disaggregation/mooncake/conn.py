@@ -407,9 +407,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _has_pd_hidden_state(self, state_indices: Optional[List]) -> bool:
         return self.pd_hidden_events.has_state(state_indices)
 
-    def _without_pd_hidden_state(
-        self, state_indices: Optional[List]
-    ) -> Optional[List]:
+    def _without_pd_hidden_state(self, state_indices: Optional[List]) -> Optional[List]:
         return self.pd_hidden_events.without_state(state_indices)
 
     def _pd_hidden_release_state_indices(
@@ -469,9 +467,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 str(hidden_start).encode("ascii"),
                 str(row_len).encode("ascii"),
                 b"1" if is_last_hidden_chunk else b"0",
-                struct.pack(f"<{len(dst_indices)}i", *[int(x) for x in dst_indices])
-                if dst_indices
-                else b"",
+                (
+                    struct.pack(f"<{len(dst_indices)}i", *[int(x) for x in dst_indices])
+                    if dst_indices
+                    else b""
+                ),
                 self.local_ip.encode("ascii"),
                 str(self.rank_port).encode("ascii"),
             ]
@@ -1964,9 +1964,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self.pd_hidden_events.inflight_chunks.pop(
                                 kv_chunk.room, None
                             )
-                    if (
-                        not kv_chunk.pd_hidden_sent
-                        and self._has_pd_hidden_state(kv_chunk.state_indices)
+                    if not kv_chunk.pd_hidden_sent and self._has_pd_hidden_state(
+                        kv_chunk.state_indices
                     ):
                         self._release_or_mark_pd_hidden_done(kv_chunk)
                     if self.enable_trace:
@@ -2042,10 +2041,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             inflight_key = self.pd_hidden_events.inflight_chunks.get(
                                 kv_chunk.room
                             )
-                        if inflight_key is not None and inflight_key != hidden_inflight_key:
-                            self._park_pd_hidden_chunk_behind_room(
-                                queue, kv_chunk
-                            )
+                        if (
+                            inflight_key is not None
+                            and inflight_key != hidden_inflight_key
+                        ):
+                            self._park_pd_hidden_chunk_behind_room(queue, kv_chunk)
                             continue
                     ack_ready = False
                     if waiting_for_ack:
@@ -2078,13 +2078,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 continue
                             self._begin_pd_hidden_transfer(kv_chunk.room)
                             try:
-                                ret, pd_hidden_done = (
-                                    self._send_pd_hidden_packet(
-                                        req,
-                                        kv_chunk.state_indices,
-                                        kv_chunk.pd_hidden_packet_idx,
-                                        executor,
-                                    )
+                                ret, pd_hidden_done = self._send_pd_hidden_packet(
+                                    req,
+                                    kv_chunk.state_indices,
+                                    kv_chunk.pd_hidden_packet_idx,
+                                    executor,
                                 )
                             finally:
                                 self._end_pd_hidden_transfer(kv_chunk.room)
@@ -2153,9 +2151,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         if hidden_inflight_key is not None:
                             with self.pd_hidden_events.inflight_lock:
-                                self.pd_hidden_events.inflight_chunks[
-                                    kv_chunk.room
-                                ] = hidden_inflight_key
+                                self.pd_hidden_events.inflight_chunks[kv_chunk.room] = (
+                                    hidden_inflight_key
+                                )
                         kv_chunk.pd_hidden_ready_sent = True
                         if self.park_pd_hidden_chunk_for_ack(
                             transfer_queue=queue,
@@ -2268,7 +2266,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info
                         )
                         if (
-                            len(kv_chunk.prefill_kv_indices) == 0
+                            kv_chunk.kv_sent
+                            or len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
                         ):
@@ -2333,54 +2332,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                        if kv_chunk.kv_sent:
-                            ret = 0
-                        elif len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
-                            ret = 0
                         else:
-                            if (
-                                self.is_mla_backend
-                                or self.is_hybrid_mla_backend
-                                or self.attn_tp_size
-                                == target_rank_registration_info.dst_attn_tp_size
-                            ):
-                                ret = self.send_kvcache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                )
-                            elif (
-                                self.enable_staging
-                                and staging_strategy is not None
-                                and target_rank_registration_info.staging is not None
-                            ):
-                                ret, deferred = self._do_staging_transfer(
-                                    staging_strategy,
-                                    kv_chunk,
-                                    req,
-                                    target_rank_registration_info,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                    queue,
-                                    prefill_unique_rank,
-                                )
-                                if deferred:
-                                    staging_deferred = True
-                                    # Chunk re-enqueued; stop processing remaining reqs for this chunk
-                                    break
-                            else:
-                                ret = self.send_kvcache_slice(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    target_rank_registration_info.dst_tp_rank,
-                                    target_rank_registration_info.dst_attn_tp_size,
-                                    target_rank_registration_info.dst_kv_item_len,
-                                    executor,
-                                )
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_attn_tp_size,
+                                target_rank_registration_info.dst_kv_item_len,
+                                executor,
+                            )
                         if ret != 0:
                             self._mark_session_failed_and_sync(
                                 kv_chunk=kv_chunk,
@@ -2518,7 +2480,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 current_status = self.request_status.get(kv_chunk.room)
-                if kv_chunk.room not in self.request_status or current_status == KVPoll.Success:
+                if (
+                    kv_chunk.room not in self.request_status
+                    or current_status == KVPoll.Success
+                ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
@@ -2546,9 +2511,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     room = int(waiting_req_bytes[1].decode("ascii"))
                     prefill_rank = int(waiting_req_bytes[2].decode("ascii"))
                     hidden_start = int(waiting_req_bytes[3].decode("ascii"))
-                    self._handle_pd_hidden_chunk_ack(
-                        room, prefill_rank, hidden_start
-                    )
+                    self._handle_pd_hidden_chunk_ack(room, prefill_rank, hidden_start)
                     continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
