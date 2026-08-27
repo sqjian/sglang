@@ -112,11 +112,12 @@ class TestDSAHCUCacheContract(unittest.TestCase):
                 key=key,
             )
 
-        pool.set_index_k_buffer.assert_called_once_with(
-            layer_id=3,
-            loc=out_cache_loc,
-            index_k=key.unsqueeze(1),
-        )
+        pool.set_index_k_buffer.assert_called_once()
+        call_kwargs = pool.set_index_k_buffer.call_args.kwargs
+        self.assertEqual(call_kwargs["layer_id"], 3)
+        self.assertIs(call_kwargs["loc"], out_cache_loc)
+        self.assertEqual(call_kwargs["index_k"].shape, (2, 1, 128))
+        self.assertTrue(torch.equal(call_kwargs["index_k"], key.unsqueeze(1)))
         pool.set_index_k_scale_buffer.assert_not_called()
 
     def test_hcu_bf16_paged_read_uses_plain_index_cache(self):

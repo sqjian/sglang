@@ -1323,6 +1323,17 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    @staticmethod
+    def _validate_pd_decode_dp_sync_parallel_sizes(ps: ParallelState) -> None:
+        if ps.pp_size != 1:
+            raise RuntimeError("PD Decode DP sync currently supports pp_size=1 only")
+        # Attention TP participates in the full scheduler group and is valid
+        # for DCP. Context parallelism remains outside the supported envelope.
+        if ps.attn_cp_size != 1:
+            raise RuntimeError(
+                "PD Decode DP sync currently supports attn_cp_size=1 only"
+            )
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1346,15 +1357,7 @@ class Scheduler(
         ):
             if not self.require_mlp_sync:
                 raise RuntimeError("PD Decode DP sync requires require_mlp_sync=True")
-            if self.ps.pp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports pp_size=1 only"
-                )
-            if self.ps.attn_tp_size != 1 or self.ps.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD Decode DP sync currently supports attn_tp_size=1 and "
-                    "attn_cp_size=1 only"
-                )
+            self._validate_pd_decode_dp_sync_parallel_sizes(self.ps)
 
             tp_ranks = list(self.tp_group.ranks)
             expected_world = (
