@@ -215,6 +215,16 @@ def materialize_full_kv_cp(
 
 _is_hip = is_hip()
 
+
+def _get_flashmla_module():
+    if _is_hcu:
+        import flash_mla
+    else:
+        from sgl_kernel import flash_mla
+
+    return flash_mla
+
+
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
@@ -2942,7 +2952,7 @@ class DeepseekSparseAttnBackend(
         page_table_1,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        flash_mla = _get_flashmla_module()
 
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
@@ -2972,7 +2982,7 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, lse = flash_mla_with_kvcache(
+        o, lse = flash_mla.flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -3563,11 +3573,11 @@ class DeepseekSparseAttnBackend(
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        from sgl_kernel.flash_mla import get_mla_metadata
+        flash_mla = _get_flashmla_module()
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        flashmla_metadata, num_splits = get_mla_metadata(
+        flashmla_metadata, num_splits = flash_mla.get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?

@@ -15,7 +15,7 @@ import os
 
 import torch
 import torch.distributed as dist
-from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows

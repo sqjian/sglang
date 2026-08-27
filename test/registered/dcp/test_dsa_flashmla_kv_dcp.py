@@ -1,10 +1,12 @@
 import math
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+import sglang.srt.layers.attention.dsa_backend as dsa_backend
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAFlashMLAMetadata,
@@ -15,6 +17,15 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSAFlashMLAKVDCP(unittest.TestCase):
+    def test_uses_hcu_flashmla_package(self):
+        hcu_flashmla = ModuleType("flash_mla")
+
+        with (
+            patch.object(dsa_backend, "_is_hcu", True),
+            patch.dict(sys.modules, {"flash_mla": hcu_flashmla}),
+        ):
+            self.assertIs(dsa_backend._get_flashmla_module(), hcu_flashmla)
+
     @patch("sglang.srt.layers.attention.dsa_backend.fixup_zero_kv_rows")
     @patch("sgl_kernel.flash_mla.flash_mla_with_kvcache")
     def test_returns_base2_lse_and_zero_row_metadata(self, mock_flashmla, mock_fixup):
