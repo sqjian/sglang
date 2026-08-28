@@ -70,6 +70,33 @@ def _class_method_calls(
     ]
 
 
+def _class_method_attribute_calls(
+    relative_path: str,
+    class_name: str,
+    method_name: str,
+    called_name: str,
+) -> list[ast.Call]:
+    tree = ast.parse((SRT_ROOT / relative_path).read_text())
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method_name
+    )
+    return [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == called_name
+    ]
+
+
 class TestDcpCacheHashDiagnostic(unittest.TestCase):
     def test_dcp1_slot_plan_keeps_every_position(self):
         global_slots = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
@@ -278,6 +305,50 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
             )
 
         self.assertTrue(config.log_sub_layer_boundaries)
+
+    def test_prefill_mlp_hash_requires_sublayer_opt_in(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "17",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "17",
+            "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH": "1",
+        }
+        parallel = SimpleNamespace(tp_rank=0)
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+        self.assertFalse(config.log_mlp_boundaries)
+
+        environment["SGLANG_DEBUG_PREFILL_MLP_HASH"] = "1"
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+        self.assertTrue(config.log_mlp_boundaries)
+
+        del environment["SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH"]
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+        ):
+            with self.assertRaisesRegex(ValueError, "requires"):
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
 
     def test_prefill_sparse_layers_reject_ambiguous_range(self):
         environment = {
@@ -492,6 +563,47 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
                 "after_prepare_mlp",
                 "after_mlp",
                 "after_postprocess_layer",
+            },
+        )
+
+        mlp_snapshot_calls = sum(
+            (
+                _class_method_attribute_calls(
+                    "models/deepseek_v2.py",
+                    "DeepseekV2MoE",
+                    method_name,
+                    "_log_prefill_mlp_hash_snapshot",
+                )
+                for method_name in (
+                    "forward_normal",
+                    "_forward_experts_with_prefill_mlp_hash",
+                )
+            ),
+            [],
+        )
+        mlp_boundaries = {
+            ast.literal_eval(
+                next(
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "boundary"
+                )
+            )
+            for call in mlp_snapshot_calls
+        }
+        self.assertEqual(
+            mlp_boundaries,
+            {
+                "mlp_after_gate",
+                "mlp_after_topk",
+                "mlp_after_dispatch",
+                "mlp_after_expert_core",
+                "mlp_after_combine",
+                "mlp_after_experts",
+                "mlp_after_shared_experts",
+                "mlp_after_shared_add",
+                "mlp_after_optional_outer_all_reduce",
+                "mlp_output",
             },
         )
 

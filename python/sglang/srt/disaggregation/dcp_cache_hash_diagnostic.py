@@ -47,6 +47,7 @@ _PREFILL_LAYER_MIN_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER"
 _PREFILL_LAYER_MAX_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER"
 _PREFILL_LAYER_IDS_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_LAYERS"
 _PREFILL_SUB_LAYER_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH"
+_PREFILL_MLP_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_MLP_HASH"
 
 
 @dataclass(frozen=True)
@@ -56,11 +57,19 @@ class PrefillLayerHashConfig:
     max_layer: int
     layer_ids: frozenset[int] | None = None
     log_sub_layer_boundaries: bool = False
+    log_mlp_boundaries: bool = False
 
     def includes(self, layer_id: int) -> bool:
         if self.layer_ids is not None:
             return layer_id in self.layer_ids
         return self.min_layer <= layer_id <= self.max_layer
+
+
+@dataclass(frozen=True)
+class PrefillMlpHashContext:
+    rid: str
+    seq_len: int
+    positions: torch.Tensor
 
 
 def should_log_cache_hash(seq_len: int) -> bool:
@@ -247,6 +256,18 @@ def _sub_layer_hash_enabled() -> bool:
     return raw_value == "1"
 
 
+def _mlp_hash_enabled(*, sub_layer_enabled: bool) -> bool:
+    raw_value = os.getenv(_PREFILL_MLP_ENABLE_ENV, "0")
+    if raw_value not in {"0", "1"}:
+        raise ValueError(f"{_PREFILL_MLP_ENABLE_ENV} must be 0 or 1, got {raw_value!r}")
+    enabled = raw_value == "1"
+    if enabled and not sub_layer_enabled:
+        raise ValueError(
+            f"{_PREFILL_MLP_ENABLE_ENV}=1 requires {_PREFILL_SUB_LAYER_ENABLE_ENV}=1"
+        )
+    return enabled
+
+
 def get_prefill_layer_hash_config(
     *,
     batch_size: int,
@@ -286,12 +307,16 @@ def get_prefill_layer_hash_config(
         return None
     if len(extend_seq_lens) != 1 or int(extend_seq_lens[0]) != target_seq_len:
         return None
+    log_sub_layer_boundaries = _sub_layer_hash_enabled()
     return PrefillLayerHashConfig(
         seq_len=target_seq_len,
         min_layer=min_layer,
         max_layer=max_layer,
         layer_ids=layer_ids,
-        log_sub_layer_boundaries=_sub_layer_hash_enabled(),
+        log_sub_layer_boundaries=log_sub_layer_boundaries,
+        log_mlp_boundaries=_mlp_hash_enabled(
+            sub_layer_enabled=log_sub_layer_boundaries
+        ),
     )
 
 

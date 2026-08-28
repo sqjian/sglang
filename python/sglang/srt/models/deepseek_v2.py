@@ -51,6 +51,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
     PrefillLayerHashConfig,
+    PrefillMlpHashContext,
     get_prefill_layer_hash_config,
     log_prefill_layer_hash_snapshot,
 )
@@ -113,7 +114,9 @@ from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
+    CombineInputFormat,
     DispatchOutput,
+    DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
@@ -902,6 +905,127 @@ class DeepseekV2MoE(nn.Module):
             and not get_exec().moe.enable_eplb
         )
 
+    def _log_prefill_mlp_hash_snapshot(
+        self,
+        context: PrefillMlpHashContext,
+        *,
+        boundary: str,
+        tensors: dict[str, torch.Tensor | None],
+    ) -> None:
+        log_prefill_layer_hash_snapshot(
+            boundary=boundary,
+            layer_id=self.layer_id,
+            rid=context.rid,
+            seq_len=context.seq_len,
+            positions=context.positions,
+            tensors=tensors,
+        )
+
+    @staticmethod
+    def _prefill_mlp_topk_tensors(topk_output) -> dict[str, torch.Tensor]:
+        topk_weights = getattr(topk_output, "topk_weights", None)
+        topk_ids = getattr(topk_output, "topk_ids", None)
+        if not isinstance(topk_weights, torch.Tensor) or not isinstance(
+            topk_ids, torch.Tensor
+        ):
+            raise RuntimeError(
+                "Prefill MLP hash diagnostic requires explicit top-k weights and IDs"
+            )
+        return {"topk_weights": topk_weights, "topk_ids": topk_ids}
+
+    @staticmethod
+    def _prefill_mlp_combine_tensor(combine_input: CombineInput) -> torch.Tensor:
+        hidden_states = getattr(combine_input, "hidden_states", None)
+        if not isinstance(hidden_states, torch.Tensor):
+            raise RuntimeError(
+                "Prefill MLP hash diagnostic requires a combine input with hidden states"
+            )
+        return hidden_states
+
+    def _forward_experts_with_prefill_mlp_hash(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: Any,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        context: PrefillMlpHashContext,
+    ) -> torch.Tensor:
+        observed_boundaries = set()
+
+        def _post_dispatch_hook(
+            dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+        ):
+            if dispatch_output.format != DispatchOutputFormat.STANDARD:
+                raise RuntimeError(
+                    "Prefill MLP hash diagnostic requires standard dispatch"
+                )
+            self._log_prefill_mlp_hash_snapshot(
+                context,
+                boundary="mlp_after_dispatch",
+                tensors={
+                    "hidden_states": dispatch_output.hidden_states,
+                    **self._prefill_mlp_topk_tensors(
+                        getattr(dispatch_output, "topk_output", None)
+                    ),
+                },
+            )
+            observed_boundaries.add("dispatch")
+
+        def _pre_combine_hook(dispatcher: BaseDispatcher, combine_input: CombineInput):
+            if combine_input.format != CombineInputFormat.STANDARD:
+                raise RuntimeError(
+                    "Prefill MLP hash diagnostic requires standard combine"
+                )
+            self._log_prefill_mlp_hash_snapshot(
+                context,
+                boundary="mlp_after_expert_core",
+                tensors={
+                    "hidden_states": self._prefill_mlp_combine_tensor(combine_input)
+                },
+            )
+            observed_boundaries.add("expert_core")
+
+        def _post_combine_hook(
+            dispatcher: BaseDispatcher, combined_hidden_states: torch.Tensor
+        ):
+            self._log_prefill_mlp_hash_snapshot(
+                context,
+                boundary="mlp_after_combine",
+                tensors={"hidden_states": combined_hidden_states},
+            )
+            observed_boundaries.add("combine")
+
+        hook_handles = [
+            self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook),
+            self.experts.dispatcher.register_pre_combine_hook(_pre_combine_hook),
+            self.experts.dispatcher.register_post_combine_hook(_post_combine_hook),
+        ]
+        try:
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
+        finally:
+            for hook_handle in hook_handles:
+                hook_handle.remove()
+
+        expected_boundaries = {"dispatch", "expert_core", "combine"}
+        if observed_boundaries != expected_boundaries:
+            raise RuntimeError(
+                "Prefill MLP hash diagnostic missed dispatcher boundaries: "
+                f"expected={sorted(expected_boundaries)}, "
+                f"observed={sorted(observed_boundaries)}"
+            )
+        self._log_prefill_mlp_hash_snapshot(
+            context,
+            boundary="mlp_after_experts",
+            tensors={"hidden_states": final_hidden_states},
+        )
+        return final_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -910,10 +1034,15 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        prefill_mlp_hash_context: Optional[PrefillMlpHashContext] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
+            if prefill_mlp_hash_context is not None:
+                raise RuntimeError(
+                    "Prefill MLP hash diagnostic does not support MegaMoE"
+                )
             return forward_mega_moe(
                 self,
                 hidden_states,
@@ -923,6 +1052,10 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
+                if prefill_mlp_hash_context is not None:
+                    raise RuntimeError(
+                        "Prefill MLP hash diagnostic requires eager single-stream MoE"
+                    )
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -936,6 +1069,10 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
+                if prefill_mlp_hash_context is not None:
+                    raise RuntimeError(
+                        "Prefill MLP hash diagnostic requires eager single-stream MoE"
+                    )
                 return self.forward_normal_dual_stream(
                     hidden_states,
                     gemm_output_zero_allocator,
@@ -949,8 +1086,13 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    prefill_mlp_hash_context=prefill_mlp_hash_context,
                 )
         else:
+            if prefill_mlp_hash_context is not None:
+                raise RuntimeError(
+                    "Prefill MLP hash diagnostic does not support all-to-all MoE"
+                )
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
@@ -1075,6 +1217,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        prefill_mlp_hash_context: Optional[PrefillMlpHashContext] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1110,6 +1253,12 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            if prefill_mlp_hash_context is not None:
+                self._log_prefill_mlp_hash_snapshot(
+                    prefill_mlp_hash_context,
+                    boundary="mlp_after_gate",
+                    tensors={"router_logits": router_logits},
+                )
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
@@ -1126,6 +1275,12 @@ class DeepseekV2MoE(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
+            )
+        if prefill_mlp_hash_context is not None:
+            self._log_prefill_mlp_hash_snapshot(
+                prefill_mlp_hash_context,
+                boundary="mlp_after_topk",
+                tensors=self._prefill_mlp_topk_tensors(topk_output),
             )
 
         if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
@@ -1158,7 +1313,14 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        if prefill_mlp_hash_context is not None:
+            final_hidden_states = self._forward_experts_with_prefill_mlp_hash(
+                hidden_states,
+                topk_output,
+                pre_quant_input,
+                prefill_mlp_hash_context,
+            )
+        elif pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
@@ -1192,21 +1354,49 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
+        if prefill_mlp_hash_context is not None:
+            self._log_prefill_mlp_hash_snapshot(
+                prefill_mlp_hash_context,
+                boundary="mlp_after_shared_experts",
+                tensors={
+                    "routed_hidden_states": final_hidden_states,
+                    "shared_output": shared_output,
+                },
+            )
+
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
+        if prefill_mlp_hash_context is not None:
+            self._log_prefill_mlp_hash_snapshot(
+                prefill_mlp_hash_context,
+                boundary="mlp_after_shared_add",
+                tensors={"hidden_states": final_hidden_states},
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        if prefill_mlp_hash_context is not None:
+            self._log_prefill_mlp_hash_snapshot(
+                prefill_mlp_hash_context,
+                boundary="mlp_after_optional_outer_all_reduce",
+                tensors={"hidden_states": final_hidden_states},
+            )
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
+        if prefill_mlp_hash_context is not None:
+            self._log_prefill_mlp_hash_snapshot(
+                prefill_mlp_hash_context,
+                boundary="mlp_output",
+                tensors={"hidden_states": final_hidden_states},
+            )
         return final_hidden_states
 
     def forward_cpu(
@@ -2587,16 +2777,36 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
+        prefill_mlp_hash_context = None
+        if log_prefill_sub_layer and prefill_layer_hash_config.log_mlp_boundaries:
+            if not isinstance(self.mlp, DeepseekV2MoE):
+                raise RuntimeError(
+                    "Prefill MLP hash diagnostic requires a DeepseekV2MoE layer"
+                )
+            prefill_mlp_hash_context = PrefillMlpHashContext(
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+            )
+
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+                if prefill_mlp_hash_context is not None:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                        prefill_mlp_hash_context=prefill_mlp_hash_context,
+                    )
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
         if log_prefill_sub_layer:
             log_prefill_layer_hash_snapshot(
                 boundary="after_mlp",
