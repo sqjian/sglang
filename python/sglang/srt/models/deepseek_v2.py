@@ -50,6 +50,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    PrefillLayerHashConfig,
     get_prefill_layer_hash_config,
     log_prefill_layer_hash_snapshot,
 )
@@ -2478,6 +2479,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         prev_topk_indices: Optional[torch.Tensor] = None,
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
+        prefill_layer_hash_config: Optional[PrefillLayerHashConfig] = None,
+        prefill_layer_hash_rid: Optional[str] = None,
     ) -> torch.Tensor:
         hidden_states_orig = hidden_states
         hidden_states, residual = (
@@ -2489,6 +2492,24 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_format=self._resolve_gfx95_quant_format(),
             )
         )
+        log_prefill_sub_layer = (
+            prefill_layer_hash_config is not None
+            and prefill_layer_hash_rid is not None
+            and prefill_layer_hash_config.includes(self.layer_id)
+        )
+        if log_prefill_sub_layer:
+            log_prefill_layer_hash_snapshot(
+                boundary="after_prepare_attn",
+                layer_id=self.layer_id,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": prev_topk_indices,
+                },
+            )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -2505,6 +2526,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
+        if log_prefill_sub_layer:
+            log_prefill_layer_hash_snapshot(
+                boundary="after_self_attn",
+                layer_id=self.layer_id,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": topk_indices,
+                },
+            )
 
         maybe_prefetch_next_full_attention_kv(
             forward_batch, next_full_attention_layer_id
@@ -2513,6 +2547,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if log_prefill_sub_layer:
+            log_prefill_layer_hash_snapshot(
+                boundary="after_prepare_mlp",
+                layer_id=self.layer_id,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": topk_indices,
+                },
+            )
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2549,6 +2596,19 @@ class DeepseekV2DecoderLayer(nn.Module):
                     forward_batch,
                     gemm_output_zero_allocator,
                 )
+        if log_prefill_sub_layer:
+            log_prefill_layer_hash_snapshot(
+                boundary="after_mlp",
+                layer_id=self.layer_id,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": topk_indices,
+                },
+            )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
@@ -2559,6 +2619,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+        if log_prefill_sub_layer:
+            log_prefill_layer_hash_snapshot(
+                boundary="after_postprocess_layer",
+                layer_id=self.layer_id,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": topk_indices,
+                },
             )
 
         return hidden_states, residual, topk_indices
@@ -2927,6 +3000,8 @@ class DeepseekV2Model(nn.Module):
                     next_full_attention_layer_id=self.next_full_attention_layer_id.get(
                         i
                     ),
+                    prefill_layer_hash_config=prefill_layer_hash,
+                    prefill_layer_hash_rid=prefill_layer_hash_rid,
                 )
                 index_topk_share.update(topk_indices)
                 if prefill_layer_hash is not None and prefill_layer_hash.includes(i):

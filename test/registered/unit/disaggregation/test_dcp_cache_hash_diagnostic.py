@@ -390,6 +390,34 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
             {"pp_stage_input", "layer_input", "layer_output"},
         )
 
+        decoder_snapshot_calls = _class_method_calls(
+            "models/deepseek_v2.py",
+            "DeepseekV2DecoderLayer",
+            "forward",
+            "log_prefill_layer_hash_snapshot",
+        )
+        self.assertEqual(len(decoder_snapshot_calls), 5)
+        decoder_boundaries = {
+            ast.literal_eval(
+                next(
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "boundary"
+                )
+            )
+            for call in decoder_snapshot_calls
+        }
+        self.assertEqual(
+            decoder_boundaries,
+            {
+                "after_prepare_attn",
+                "after_self_attn",
+                "after_prepare_mlp",
+                "after_mlp",
+                "after_postprocess_layer",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
