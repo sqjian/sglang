@@ -379,6 +379,7 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
         self.assertFalse(config.log_sub_layer_boundaries)
         self.assertFalse(config.log_mlp_boundaries)
         self.assertTrue(config.log_all_rank_outer_reduce_boundaries)
+        self.assertFalse(config.log_all_rank_mlp_internal_boundaries)
 
         with (
             patch.dict(os.environ, environment, clear=True),
@@ -423,6 +424,60 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
                 diagnostic,
                 "get_parallel",
                 return_value=SimpleNamespace(tp_rank=3),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "requires"):
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
+
+    def test_prefill_mlp_all_rank_internal_hash_enables_full_peer_probe(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "12",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "77",
+            "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_MLP_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_MLP_ALL_RANK_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_MLP_ALL_RANK_INTERNAL_HASH": "1",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=4),
+            ),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+
+        self.assertIsNotNone(config)
+        self.assertFalse(config.log_layer_boundaries)
+        self.assertFalse(config.log_sub_layer_boundaries)
+        self.assertFalse(config.log_mlp_boundaries)
+        self.assertTrue(config.log_all_rank_outer_reduce_boundaries)
+        self.assertTrue(config.log_all_rank_mlp_internal_boundaries)
+
+        decoder_source = (SRT_ROOT / "models/deepseek_v2.py").read_text()
+        self.assertIn(
+            "prefill_layer_hash_config.log_all_rank_mlp_internal_boundaries",
+            decoder_source,
+        )
+
+        del environment["SGLANG_DEBUG_PREFILL_MLP_ALL_RANK_HASH"]
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=4),
             ),
         ):
             with self.assertRaisesRegex(ValueError, "requires"):

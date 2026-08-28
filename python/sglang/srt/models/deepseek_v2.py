@@ -2788,7 +2788,16 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         prefill_mlp_hash_context = None
         prefill_mlp_outer_reduce_hash_context = None
-        if log_prefill_sub_layer and prefill_layer_hash_config.log_mlp_boundaries:
+        log_prefill_mlp_internal = (
+            prefill_layer_hash_config is not None
+            and prefill_layer_hash_rid is not None
+            and prefill_layer_hash_config.includes(self.layer_id)
+            and (
+                prefill_layer_hash_config.log_mlp_boundaries
+                or prefill_layer_hash_config.log_all_rank_mlp_internal_boundaries
+            )
+        )
+        if log_prefill_mlp_internal:
             if not isinstance(self.mlp, DeepseekV2MoE):
                 raise RuntimeError(
                     "Prefill MLP hash diagnostic requires a DeepseekV2MoE layer"

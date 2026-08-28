@@ -49,6 +49,9 @@ _PREFILL_LAYER_IDS_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_LAYERS"
 _PREFILL_SUB_LAYER_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH"
 _PREFILL_MLP_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_MLP_HASH"
 _PREFILL_MLP_ALL_RANK_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_MLP_ALL_RANK_HASH"
+_PREFILL_MLP_ALL_RANK_INTERNAL_ENABLE_ENV = (
+    "SGLANG_DEBUG_PREFILL_MLP_ALL_RANK_INTERNAL_HASH"
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,7 @@ class PrefillLayerHashConfig:
     log_sub_layer_boundaries: bool = False
     log_mlp_boundaries: bool = False
     log_all_rank_outer_reduce_boundaries: bool = False
+    log_all_rank_mlp_internal_boundaries: bool = False
 
     def includes(self, layer_id: int) -> bool:
         if self.layer_ids is not None:
@@ -285,6 +289,20 @@ def _mlp_all_rank_hash_enabled(*, mlp_enabled: bool) -> bool:
     return enabled
 
 
+def _mlp_all_rank_internal_hash_enabled(*, all_rank_outer_reduce_enabled: bool) -> bool:
+    raw_value = os.getenv(_PREFILL_MLP_ALL_RANK_INTERNAL_ENABLE_ENV, "0")
+    if raw_value not in {"0", "1"}:
+        raise ValueError(
+            f"{_PREFILL_MLP_ALL_RANK_INTERNAL_ENABLE_ENV} must be 0 or 1, got {raw_value!r}"
+        )
+    enabled = raw_value == "1"
+    if enabled and not all_rank_outer_reduce_enabled:
+        raise ValueError(
+            f"{_PREFILL_MLP_ALL_RANK_INTERNAL_ENABLE_ENV}=1 requires {_PREFILL_MLP_ALL_RANK_ENABLE_ENV}=1"
+        )
+    return enabled
+
+
 def get_prefill_layer_hash_config(
     *,
     batch_size: int,
@@ -327,6 +345,9 @@ def get_prefill_layer_hash_config(
     log_all_rank_outer_reduce_boundaries = _mlp_all_rank_hash_enabled(
         mlp_enabled=log_mlp_boundaries
     )
+    log_all_rank_mlp_internal_boundaries = _mlp_all_rank_internal_hash_enabled(
+        all_rank_outer_reduce_enabled=log_all_rank_outer_reduce_boundaries
+    )
     is_primary_tp_rank = get_parallel().tp_rank == 0
     if not is_primary_tp_rank and not log_all_rank_outer_reduce_boundaries:
         return None
@@ -339,6 +360,7 @@ def get_prefill_layer_hash_config(
         log_sub_layer_boundaries=(is_primary_tp_rank and log_sub_layer_boundaries),
         log_mlp_boundaries=is_primary_tp_rank and log_mlp_boundaries,
         log_all_rank_outer_reduce_boundaries=(log_all_rank_outer_reduce_boundaries),
+        log_all_rank_mlp_internal_boundaries=(log_all_rank_mlp_internal_boundaries),
     )
 
 
