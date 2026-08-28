@@ -11,9 +11,11 @@ import torch
 from sglang.srt.disaggregation import dcp_cache_hash_diagnostic as diagnostic
 from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
     build_owned_slot_plan,
+    get_prefill_layer_hash_config,
     hash_int_sequence,
     hash_positioned_rows,
     log_dsa_cache_hash_snapshot,
+    log_prefill_layer_hash_snapshot,
     should_log_cache_hash,
     xor_hex_digests,
 )
@@ -38,6 +40,33 @@ def _function_calls(relative_path: str, function_name: str) -> list[ast.Call]:
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in {"log_dsa_cache_hash_snapshot", "log_dcp_transfer_plan"}
+    ]
+
+
+def _class_method_calls(
+    relative_path: str,
+    class_name: str,
+    method_name: str,
+    called_name: str,
+) -> list[ast.Call]:
+    tree = ast.parse((SRT_ROOT / relative_path).read_text())
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method_name
+    )
+    return [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == called_name
     ]
 
 
@@ -102,6 +131,137 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "must be an integer"):
                 should_log_cache_hash(727)
+
+    def test_prefill_layer_hash_gate_is_default_off_and_exact(self):
+        parallel = SimpleNamespace(tp_rank=0)
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "39",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "51",
+        }
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+        ):
+            self.assertIsNone(
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
+            )
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+            self.assertEqual(
+                (config.seq_len, config.min_layer, config.max_layer), (727, 39, 51)
+            )
+            self.assertIsNone(
+                get_prefill_layer_hash_config(
+                    batch_size=2,
+                    is_extend=True,
+                    extend_seq_lens=[727, 727],
+                )
+            )
+            self.assertIsNone(
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=False,
+                    extend_seq_lens=[727],
+                )
+            )
+            self.assertIsNone(
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[728],
+                )
+            )
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=1),
+            ),
+        ):
+            self.assertIsNone(
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
+            )
+
+    def test_invalid_prefill_layer_hash_range_fails_fast(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "52",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "51",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "invalid layer range"):
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
+
+    def test_prefill_layer_snapshot_hashes_without_tensor_contents(self):
+        parallel = SimpleNamespace(
+            world_rank=16,
+            tp_rank=0,
+            pp_rank=2,
+            attn_tp_rank=0,
+            attn_dp_rank=0,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+        )
+        positions = torch.tensor([0, 1], dtype=torch.int64)
+        tensors = {
+            "hidden_states": torch.tensor([[11, 12], [13, 14]], dtype=torch.int32),
+            "residual": None,
+            "topk_indices": torch.tensor([[3], [4]], dtype=torch.int32),
+        }
+
+        with (
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+            patch.object(diagnostic.logger, "info") as info,
+        ):
+            log_prefill_layer_hash_snapshot(
+                boundary="layer_input",
+                layer_id=51,
+                rid="sensitive-request-id",
+                seq_len=2,
+                positions=positions,
+                tensors=tensors,
+            )
+
+        payloads = [json.loads(call.args[2]) for call in info.call_args_list]
+        self.assertEqual(len(payloads), 3)
+        by_component = {payload["component"]: payload for payload in payloads}
+        self.assertEqual(by_component["hidden_states"]["row_count"], 2)
+        self.assertFalse(by_component["residual"]["present"])
+        self.assertTrue(by_component["topk_indices"]["present"])
+        self.assertNotIn("sensitive-request-id", json.dumps(payloads))
 
     def test_snapshot_logs_hashes_and_counts_without_tensor_contents(self):
         parallel = SimpleNamespace(
@@ -190,6 +350,37 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
         self.assertEqual(
             decode_keywords["pool"],
             "self.scheduler.token_to_kv_pool_allocator.get_kvcache()",
+        )
+
+    def test_prefill_layer_hash_hooks_cover_stage_input_and_layer_boundaries(self):
+        config_calls = _class_method_calls(
+            "models/deepseek_v2.py",
+            "DeepseekV2Model",
+            "forward",
+            "get_prefill_layer_hash_config",
+        )
+        snapshot_calls = _class_method_calls(
+            "models/deepseek_v2.py",
+            "DeepseekV2Model",
+            "forward",
+            "log_prefill_layer_hash_snapshot",
+        )
+
+        self.assertEqual(len(config_calls), 1)
+        self.assertEqual(len(snapshot_calls), 3)
+        boundaries = {
+            ast.literal_eval(
+                next(
+                    keyword.value
+                    for keyword in call.keywords
+                    if keyword.arg == "boundary"
+                )
+            )
+            for call in snapshot_calls
+        }
+        self.assertEqual(
+            boundaries,
+            {"pp_stage_input", "layer_input", "layer_output"},
         )
 
 

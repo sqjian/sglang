@@ -49,6 +49,10 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
+from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    get_prefill_layer_hash_config,
+    log_prefill_layer_hash_snapshot,
+)
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
@@ -2837,6 +2841,31 @@ class DeepseekV2Model(nn.Module):
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        prefill_layer_hash = get_prefill_layer_hash_config(
+            batch_size=forward_batch.batch_size,
+            is_extend=forward_batch.forward_mode.is_extend(),
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+        )
+        prefill_layer_hash_rid = None
+        if prefill_layer_hash is not None:
+            if forward_batch.rids is None or len(forward_batch.rids) != 1:
+                raise RuntimeError(
+                    "Prefill layer hash diagnostic requires exactly one request ID"
+                )
+            prefill_layer_hash_rid = forward_batch.rids[0]
+            log_prefill_layer_hash_snapshot(
+                boundary="pp_stage_input",
+                layer_id=self.start_layer,
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash.seq_len,
+                positions=positions,
+                tensors={
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": initial_topk_indices,
+                },
+            )
+
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling: Optional[torch.Tensor] = None
@@ -2870,6 +2899,19 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 layer = self.layers[i]
+                if prefill_layer_hash is not None and prefill_layer_hash.includes(i):
+                    log_prefill_layer_hash_snapshot(
+                        boundary="layer_input",
+                        layer_id=i,
+                        rid=prefill_layer_hash_rid,
+                        seq_len=prefill_layer_hash.seq_len,
+                        positions=positions,
+                        tensors={
+                            "hidden_states": hidden_states,
+                            "residual": residual,
+                            "topk_indices": index_topk_share.topk_indices,
+                        },
+                    )
                 hidden_states, residual, topk_indices = layer(
                     positions,
                     hidden_states,
@@ -2887,6 +2929,19 @@ class DeepseekV2Model(nn.Module):
                     ),
                 )
                 index_topk_share.update(topk_indices)
+                if prefill_layer_hash is not None and prefill_layer_hash.includes(i):
+                    log_prefill_layer_hash_snapshot(
+                        boundary="layer_output",
+                        layer_id=i,
+                        rid=prefill_layer_hash_rid,
+                        seq_len=prefill_layer_hash.seq_len,
+                        positions=positions,
+                        tensors={
+                            "hidden_states": hidden_states,
+                            "residual": residual,
+                            "topk_indices": index_topk_share.topk_indices,
+                        },
+                    )
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

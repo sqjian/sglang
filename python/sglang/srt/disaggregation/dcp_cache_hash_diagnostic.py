@@ -27,6 +27,7 @@ import logging
 import os
 import struct
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -40,6 +41,20 @@ _ENABLE_ENV = "SGLANG_DEBUG_DCP_CACHE_HASH"
 _SEQ_LEN_ENV = "SGLANG_DEBUG_DCP_CACHE_HASH_SEQ_LEN"
 _LOG_PREFIX = "DCP_CACHE_HASH_DIAGNOSTIC "
 _ZERO_DIGEST = "00" * hashlib.sha256().digest_size
+_PREFILL_LAYER_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH"
+_PREFILL_LAYER_SEQ_LEN_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN"
+_PREFILL_LAYER_MIN_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER"
+_PREFILL_LAYER_MAX_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER"
+
+
+@dataclass(frozen=True)
+class PrefillLayerHashConfig:
+    seq_len: int
+    min_layer: int
+    max_layer: int
+
+    def includes(self, layer_id: int) -> bool:
+        return self.min_layer <= layer_id <= self.max_layer
 
 
 def should_log_cache_hash(seq_len: int) -> bool:
@@ -179,6 +194,111 @@ def _layer_records(
 
 def _emit(payload: dict[str, Any]) -> None:
     logger.info("%s%s", _LOG_PREFIX, json.dumps(payload, sort_keys=True))
+
+
+def _required_int_env(name: str, *, minimum: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        raise ValueError(f"{name} must be set when {_PREFILL_LAYER_ENABLE_ENV}=1")
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from error
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def get_prefill_layer_hash_config(
+    *,
+    batch_size: int,
+    is_extend: bool,
+    extend_seq_lens: Sequence[int] | None,
+) -> PrefillLayerHashConfig | None:
+    """Return the opt-in layer-hash plan for one exact Prefill request."""
+    if os.getenv(_PREFILL_LAYER_ENABLE_ENV, "0") != "1":
+        return None
+
+    target_seq_len = _required_int_env(_PREFILL_LAYER_SEQ_LEN_ENV, minimum=1)
+    min_layer = _required_int_env(_PREFILL_LAYER_MIN_ENV, minimum=0)
+    max_layer = _required_int_env(_PREFILL_LAYER_MAX_ENV, minimum=0)
+    if min_layer > max_layer:
+        raise ValueError(
+            f"invalid layer range: min_layer={min_layer}, max_layer={max_layer}"
+        )
+
+    if get_parallel().tp_rank != 0:
+        return None
+    if not is_extend or batch_size != 1 or extend_seq_lens is None:
+        return None
+    if len(extend_seq_lens) != 1 or int(extend_seq_lens[0]) != target_seq_len:
+        return None
+    return PrefillLayerHashConfig(
+        seq_len=target_seq_len,
+        min_layer=min_layer,
+        max_layer=max_layer,
+    )
+
+
+def log_prefill_layer_hash_snapshot(
+    *,
+    boundary: str,
+    layer_id: int,
+    rid: str,
+    seq_len: int,
+    positions: torch.Tensor,
+    tensors: dict[str, torch.Tensor | None],
+) -> None:
+    """Log content-free hashes for one Prefill layer boundary."""
+    if positions.ndim != 1 or positions.numel() != seq_len:
+        raise ValueError(
+            f"prefill layer hash needs {seq_len} positions, got {positions.shape}"
+        )
+
+    common = {
+        "record_type": "prefill_layer_tensor_hash",
+        "boundary": boundary,
+        "layer_id": int(layer_id),
+        "rid_sha256": hashlib.sha256(str(rid).encode()).hexdigest(),
+        "seq_len": int(seq_len),
+        "positions_sha256": hash_int_sequence(positions),
+        "topology": _topology(),
+    }
+    for component, tensor in sorted(tensors.items()):
+        if tensor is None:
+            _emit(
+                {
+                    **common,
+                    "component": component,
+                    "present": False,
+                    "shape": None,
+                    "dtype": None,
+                    "row_count": 0,
+                    "row_nbytes": 0,
+                    "content_xor_sha256": None,
+                }
+            )
+            continue
+        if tensor.ndim == 0 or tensor.shape[0] != seq_len:
+            raise ValueError(
+                f"prefill layer hash component {component!r} needs {seq_len} rows, got {tensor.shape}"
+            )
+        _emit(
+            {
+                **common,
+                "component": component,
+                "present": True,
+                "shape": [int(size) for size in tensor.shape],
+                "dtype": str(tensor.dtype),
+                "row_count": int(tensor.shape[0]),
+                "row_nbytes": int(tensor[0].numel() * tensor[0].element_size()),
+                "content_xor_sha256": hash_positioned_rows(
+                    tensor,
+                    positions,
+                    layer_id=layer_id,
+                ),
+            }
+        )
 
 
 def log_dsa_cache_hash_snapshot(
