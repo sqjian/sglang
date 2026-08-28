@@ -225,6 +225,83 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
                     extend_seq_lens=[727],
                 )
 
+    def test_prefill_layer_hash_sparse_layers_are_exact_and_outer_only(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_LAYERS": "12,24,36,48,60,72,77",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+
+        self.assertEqual(config.min_layer, 12)
+        self.assertEqual(config.max_layer, 77)
+        self.assertEqual(
+            config.layer_ids,
+            frozenset({12, 24, 36, 48, 60, 72, 77}),
+        )
+        self.assertTrue(config.includes(48))
+        self.assertFalse(config.includes(49))
+        self.assertFalse(config.log_sub_layer_boundaries)
+
+    def test_prefill_sub_layer_hash_requires_explicit_opt_in(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "17",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "17",
+            "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH": "1",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            config = get_prefill_layer_hash_config(
+                batch_size=1,
+                is_extend=True,
+                extend_seq_lens=[727],
+            )
+
+        self.assertTrue(config.log_sub_layer_boundaries)
+
+    def test_prefill_sparse_layers_reject_ambiguous_range(self):
+        environment = {
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH": "1",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN": "727",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_LAYERS": "12,24",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER": "12",
+            "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER": "24",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(
+                diagnostic,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                get_prefill_layer_hash_config(
+                    batch_size=1,
+                    is_extend=True,
+                    extend_seq_lens=[727],
+                )
+
     def test_prefill_layer_snapshot_hashes_without_tensor_contents(self):
         parallel = SimpleNamespace(
             world_rank=16,

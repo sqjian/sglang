@@ -45,6 +45,8 @@ _PREFILL_LAYER_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH"
 _PREFILL_LAYER_SEQ_LEN_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_SEQ_LEN"
 _PREFILL_LAYER_MIN_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MIN_LAYER"
 _PREFILL_LAYER_MAX_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_MAX_LAYER"
+_PREFILL_LAYER_IDS_ENV = "SGLANG_DEBUG_PREFILL_LAYER_HASH_LAYERS"
+_PREFILL_SUB_LAYER_ENABLE_ENV = "SGLANG_DEBUG_PREFILL_SUB_LAYER_HASH"
 
 
 @dataclass(frozen=True)
@@ -52,8 +54,12 @@ class PrefillLayerHashConfig:
     seq_len: int
     min_layer: int
     max_layer: int
+    layer_ids: frozenset[int] | None = None
+    log_sub_layer_boundaries: bool = False
 
     def includes(self, layer_id: int) -> bool:
+        if self.layer_ids is not None:
+            return layer_id in self.layer_ids
         return self.min_layer <= layer_id <= self.max_layer
 
 
@@ -209,6 +215,38 @@ def _required_int_env(name: str, *, minimum: int) -> int:
     return value
 
 
+def _parse_sparse_layer_ids(raw_value: str) -> frozenset[int]:
+    raw_items = raw_value.split(",")
+    if not raw_items or any(not item.strip() for item in raw_items):
+        raise ValueError(
+            f"{_PREFILL_LAYER_IDS_ENV} must be a comma-separated list of integers"
+        )
+    try:
+        layer_ids = [int(item) for item in raw_items]
+    except ValueError as error:
+        raise ValueError(
+            f"{_PREFILL_LAYER_IDS_ENV} must be a comma-separated list of integers, got {raw_value!r}"
+        ) from error
+    if any(layer_id < 0 for layer_id in layer_ids):
+        raise ValueError(
+            f"{_PREFILL_LAYER_IDS_ENV} values must be >= 0, got {raw_value!r}"
+        )
+    if len(set(layer_ids)) != len(layer_ids):
+        raise ValueError(
+            f"{_PREFILL_LAYER_IDS_ENV} must not contain duplicates, got {raw_value!r}"
+        )
+    return frozenset(layer_ids)
+
+
+def _sub_layer_hash_enabled() -> bool:
+    raw_value = os.getenv(_PREFILL_SUB_LAYER_ENABLE_ENV, "0")
+    if raw_value not in {"0", "1"}:
+        raise ValueError(
+            f"{_PREFILL_SUB_LAYER_ENABLE_ENV} must be 0 or 1, got {raw_value!r}"
+        )
+    return raw_value == "1"
+
+
 def get_prefill_layer_hash_config(
     *,
     batch_size: int,
@@ -220,12 +258,27 @@ def get_prefill_layer_hash_config(
         return None
 
     target_seq_len = _required_int_env(_PREFILL_LAYER_SEQ_LEN_ENV, minimum=1)
-    min_layer = _required_int_env(_PREFILL_LAYER_MIN_ENV, minimum=0)
-    max_layer = _required_int_env(_PREFILL_LAYER_MAX_ENV, minimum=0)
-    if min_layer > max_layer:
+    raw_layer_ids = os.getenv(_PREFILL_LAYER_IDS_ENV)
+    has_range = (
+        os.getenv(_PREFILL_LAYER_MIN_ENV) is not None
+        or os.getenv(_PREFILL_LAYER_MAX_ENV) is not None
+    )
+    if raw_layer_ids is not None and has_range:
         raise ValueError(
-            f"invalid layer range: min_layer={min_layer}, max_layer={max_layer}"
+            f"{_PREFILL_LAYER_IDS_ENV} and {_PREFILL_LAYER_MIN_ENV}/{_PREFILL_LAYER_MAX_ENV} are mutually exclusive"
         )
+    if raw_layer_ids is not None:
+        layer_ids = _parse_sparse_layer_ids(raw_layer_ids)
+        min_layer = min(layer_ids)
+        max_layer = max(layer_ids)
+    else:
+        layer_ids = None
+        min_layer = _required_int_env(_PREFILL_LAYER_MIN_ENV, minimum=0)
+        max_layer = _required_int_env(_PREFILL_LAYER_MAX_ENV, minimum=0)
+        if min_layer > max_layer:
+            raise ValueError(
+                f"invalid layer range: min_layer={min_layer}, max_layer={max_layer}"
+            )
 
     if get_parallel().tp_rank != 0:
         return None
@@ -237,6 +290,8 @@ def get_prefill_layer_hash_config(
         seq_len=target_seq_len,
         min_layer=min_layer,
         max_layer=max_layer,
+        layer_ids=layer_ids,
+        log_sub_layer_boundaries=_sub_layer_hash_enabled(),
     )
 
 

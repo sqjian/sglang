@@ -2496,6 +2496,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefill_layer_hash_config is not None
             and prefill_layer_hash_rid is not None
             and prefill_layer_hash_config.includes(self.layer_id)
+            and prefill_layer_hash_config.log_sub_layer_boundaries
         )
         if log_prefill_sub_layer:
             log_prefill_layer_hash_snapshot(
