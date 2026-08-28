@@ -1035,11 +1035,16 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         prefill_mlp_hash_context: Optional[PrefillMlpHashContext] = None,
+        prefill_mlp_outer_reduce_hash_context: Optional[PrefillMlpHashContext] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
+        prefill_mlp_diagnostic = (
+            prefill_mlp_hash_context is not None
+            or prefill_mlp_outer_reduce_hash_context is not None
+        )
         if should_use_mega_moe(self, hidden_states):
-            if prefill_mlp_hash_context is not None:
+            if prefill_mlp_diagnostic:
                 raise RuntimeError(
                     "Prefill MLP hash diagnostic does not support MegaMoE"
                 )
@@ -1052,7 +1057,7 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
-                if prefill_mlp_hash_context is not None:
+                if prefill_mlp_diagnostic:
                     raise RuntimeError(
                         "Prefill MLP hash diagnostic requires eager single-stream MoE"
                     )
@@ -1069,7 +1074,7 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
-                if prefill_mlp_hash_context is not None:
+                if prefill_mlp_diagnostic:
                     raise RuntimeError(
                         "Prefill MLP hash diagnostic requires eager single-stream MoE"
                     )
@@ -1087,9 +1092,12 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
                     prefill_mlp_hash_context=prefill_mlp_hash_context,
+                    prefill_mlp_outer_reduce_hash_context=(
+                        prefill_mlp_outer_reduce_hash_context
+                    ),
                 )
         else:
-            if prefill_mlp_hash_context is not None:
+            if prefill_mlp_diagnostic:
                 raise RuntimeError(
                     "Prefill MLP hash diagnostic does not support all-to-all MoE"
                 )
@@ -1218,6 +1226,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         prefill_mlp_hash_context: Optional[PrefillMlpHashContext] = None,
+        prefill_mlp_outer_reduce_hash_context: Optional[PrefillMlpHashContext] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1370,9 +1379,9 @@ class DeepseekV2MoE(nn.Module):
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
-        if prefill_mlp_hash_context is not None:
+        if prefill_mlp_outer_reduce_hash_context is not None:
             self._log_prefill_mlp_hash_snapshot(
-                prefill_mlp_hash_context,
+                prefill_mlp_outer_reduce_hash_context,
                 boundary="mlp_after_shared_add",
                 tensors={"hidden_states": final_hidden_states},
             )
@@ -1381,9 +1390,9 @@ class DeepseekV2MoE(nn.Module):
             is_tp_path=True,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        if prefill_mlp_hash_context is not None:
+        if prefill_mlp_outer_reduce_hash_context is not None:
             self._log_prefill_mlp_hash_snapshot(
-                prefill_mlp_hash_context,
+                prefill_mlp_outer_reduce_hash_context,
                 boundary="mlp_after_optional_outer_all_reduce",
                 tensors={"hidden_states": final_hidden_states},
             )
@@ -2778,6 +2787,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         prefill_mlp_hash_context = None
+        prefill_mlp_outer_reduce_hash_context = None
         if log_prefill_sub_layer and prefill_layer_hash_config.log_mlp_boundaries:
             if not isinstance(self.mlp, DeepseekV2MoE):
                 raise RuntimeError(
@@ -2788,18 +2798,37 @@ class DeepseekV2DecoderLayer(nn.Module):
                 seq_len=prefill_layer_hash_config.seq_len,
                 positions=positions,
             )
+            prefill_mlp_outer_reduce_hash_context = prefill_mlp_hash_context
+        elif (
+            prefill_layer_hash_config is not None
+            and prefill_layer_hash_rid is not None
+            and prefill_layer_hash_config.includes(self.layer_id)
+            and prefill_layer_hash_config.log_all_rank_outer_reduce_boundaries
+        ):
+            if not isinstance(self.mlp, DeepseekV2MoE):
+                raise RuntimeError(
+                    "Prefill MLP all-rank hash diagnostic requires a DeepseekV2MoE layer"
+                )
+            prefill_mlp_outer_reduce_hash_context = PrefillMlpHashContext(
+                rid=prefill_layer_hash_rid,
+                seq_len=prefill_layer_hash_config.seq_len,
+                positions=positions,
+            )
 
         with get_forward().scoped(
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                if prefill_mlp_hash_context is not None:
+                if prefill_mlp_outer_reduce_hash_context is not None:
                     hidden_states = self.mlp(
                         hidden_states,
                         forward_batch,
                         gemm_output_zero_allocator,
                         prefill_mlp_hash_context=prefill_mlp_hash_context,
+                        prefill_mlp_outer_reduce_hash_context=(
+                            prefill_mlp_outer_reduce_hash_context
+                        ),
                     )
                 else:
                     hidden_states = self.mlp(
@@ -3137,18 +3166,19 @@ class DeepseekV2Model(nn.Module):
                     "Prefill layer hash diagnostic requires exactly one request ID"
                 )
             prefill_layer_hash_rid = forward_batch.rids[0]
-            log_prefill_layer_hash_snapshot(
-                boundary="pp_stage_input",
-                layer_id=self.start_layer,
-                rid=prefill_layer_hash_rid,
-                seq_len=prefill_layer_hash.seq_len,
-                positions=positions,
-                tensors={
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                    "topk_indices": initial_topk_indices,
-                },
-            )
+            if prefill_layer_hash.log_layer_boundaries:
+                log_prefill_layer_hash_snapshot(
+                    boundary="pp_stage_input",
+                    layer_id=self.start_layer,
+                    rid=prefill_layer_hash_rid,
+                    seq_len=prefill_layer_hash.seq_len,
+                    positions=positions,
+                    tensors={
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                        "topk_indices": initial_topk_indices,
+                    },
+                )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         # Compute llama 4 scaling once per forward pass if enabled
@@ -3183,7 +3213,11 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 layer = self.layers[i]
-                if prefill_layer_hash is not None and prefill_layer_hash.includes(i):
+                if (
+                    prefill_layer_hash is not None
+                    and prefill_layer_hash.log_layer_boundaries
+                    and prefill_layer_hash.includes(i)
+                ):
                     log_prefill_layer_hash_snapshot(
                         boundary="layer_input",
                         layer_id=i,
@@ -3215,7 +3249,11 @@ class DeepseekV2Model(nn.Module):
                     prefill_layer_hash_rid=prefill_layer_hash_rid,
                 )
                 index_topk_share.update(topk_indices)
-                if prefill_layer_hash is not None and prefill_layer_hash.includes(i):
+                if (
+                    prefill_layer_hash is not None
+                    and prefill_layer_hash.log_layer_boundaries
+                    and prefill_layer_hash.includes(i)
+                ):
                     log_prefill_layer_hash_snapshot(
                         boundary="layer_output",
                         layer_id=i,
