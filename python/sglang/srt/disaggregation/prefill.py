@@ -37,6 +37,9 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    log_dsa_cache_hash_snapshot,
+)
 from sglang.srt.disaggregation.hidden_state import (
     get_pd_hidden_capture_layer_ids,
     get_pd_hidden_req_state as pd_hidden_state,
@@ -2130,6 +2133,18 @@ class SchedulerDisaggregationPrefillMixin:
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+
+            if last_chunk:
+                log_dsa_cache_hash_snapshot(
+                    stage="prefill_pre_send",
+                    rid=req.rid,
+                    bootstrap_room=req.bootstrap_room,
+                    seq_len=seq_len,
+                    global_slots=self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :seq_len
+                    ],
+                    pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                )
 
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page

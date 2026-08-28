@@ -46,6 +46,9 @@ from sglang.srt.disaggregation.common.utils import (
     PDHiddenChunk,
     PDHiddenRequestState,
 )
+from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    log_dsa_cache_hash_snapshot,
+)
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -3023,6 +3026,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self._inject_full_pd_hidden(decode_req)
                 if not hidden_state.request_done():
                     continue
+                seq_len = len(decode_req.req.origin_input_ids)
+                log_dsa_cache_hash_snapshot(
+                    stage="decode_post_receive",
+                    rid=decode_req.req.rid,
+                    bootstrap_room=decode_req.req.bootstrap_room,
+                    seq_len=seq_len,
+                    global_slots=self.scheduler.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, :seq_len
+                    ],
+                    pool=self.scheduler.token_to_kv_pool_allocator.get_kvcache(),
+                )
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption

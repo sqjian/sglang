@@ -42,6 +42,9 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    log_dcp_transfer_plan,
+)
 from sglang.srt.disaggregation.hidden_events import PDHiddenEventManager
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -1108,6 +1111,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
+        )
+        log_dcp_transfer_plan(
+            session_id=mooncake_session_id,
+            seq_len=num_kv_tokens,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            src_page_indices=prefill_kv_indices,
+            dst_page_indices=dst_kv_indices,
+            src_token_indices=plan.src_token_indices,
+            dst_token_indices=plan.dst_token_indices,
         )
         if plan.src_token_indices.size == 0:
             return 0

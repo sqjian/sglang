@@ -1,0 +1,197 @@
+import ast
+import json
+import os
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+
+from sglang.srt.disaggregation import dcp_cache_hash_diagnostic as diagnostic
+from sglang.srt.disaggregation.dcp_cache_hash_diagnostic import (
+    build_owned_slot_plan,
+    hash_int_sequence,
+    hash_positioned_rows,
+    log_dsa_cache_hash_snapshot,
+    should_log_cache_hash,
+    xor_hex_digests,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+SRT_ROOT = Path(__file__).resolve().parents[4] / "python/sglang/srt"
+
+
+def _function_calls(relative_path: str, function_name: str) -> list[ast.Call]:
+    tree = ast.parse((SRT_ROOT / relative_path).read_text())
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == function_name
+    )
+    return [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"log_dsa_cache_hash_snapshot", "log_dcp_transfer_plan"}
+    ]
+
+
+class TestDcpCacheHashDiagnostic(unittest.TestCase):
+    def test_dcp1_slot_plan_keeps_every_position(self):
+        global_slots = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
+
+        positions, local_slots = build_owned_slot_plan(
+            global_slots, dcp_size=1, dcp_rank=0
+        )
+
+        torch.testing.assert_close(positions, torch.arange(4))
+        torch.testing.assert_close(local_slots, global_slots)
+
+    def test_dcp8_slot_plan_uses_global_owner_and_local_slot(self):
+        global_slots = torch.arange(512, 524, dtype=torch.int64)
+
+        positions, local_slots = build_owned_slot_plan(
+            global_slots, dcp_size=8, dcp_rank=3
+        )
+
+        torch.testing.assert_close(positions, torch.tensor([3, 11]))
+        torch.testing.assert_close(local_slots, torch.tensor([64, 65]))
+
+    def test_partitioned_row_hashes_combine_to_full_hash(self):
+        rows = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+        positions = torch.arange(6, dtype=torch.int64)
+        full = hash_positioned_rows(rows, positions, layer_id=7)
+        partitioned = [
+            hash_positioned_rows(rows[rank::2], positions[rank::2], layer_id=7)
+            for rank in range(2)
+        ]
+
+        self.assertEqual(xor_hex_digests(partitioned), full)
+
+    def test_integer_sequence_hash_depends_on_order(self):
+        self.assertNotEqual(hash_int_sequence([1, 2]), hash_int_sequence([2, 1]))
+
+    def test_diagnostic_is_default_off_and_exact_length_gated(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(should_log_cache_hash(727))
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DEBUG_DCP_CACHE_HASH": "1",
+                "SGLANG_DEBUG_DCP_CACHE_HASH_SEQ_LEN": "727",
+            },
+            clear=True,
+        ):
+            self.assertTrue(should_log_cache_hash(727))
+            self.assertFalse(should_log_cache_hash(728))
+
+    def test_invalid_length_gate_fails_fast(self):
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DEBUG_DCP_CACHE_HASH": "1",
+                "SGLANG_DEBUG_DCP_CACHE_HASH_SEQ_LEN": "not-an-int",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be an integer"):
+                should_log_cache_hash(727)
+
+    def test_snapshot_logs_hashes_and_counts_without_tensor_contents(self):
+        parallel = SimpleNamespace(
+            world_rank=1,
+            tp_rank=1,
+            pp_rank=0,
+            attn_tp_rank=1,
+            attn_dp_rank=0,
+            attn_dcp_size=2,
+            attn_dcp_rank=1,
+        )
+        pool = SimpleNamespace(
+            kv_buffer=[torch.arange(16, dtype=torch.int32).reshape(8, 1, 2)],
+            index_k_buffer=[torch.arange(16, dtype=torch.int32).reshape(1, 8, 1, 2)],
+            start_layer=4,
+        )
+        environment = {
+            "SGLANG_DEBUG_DCP_CACHE_HASH": "1",
+            "SGLANG_DEBUG_DCP_CACHE_HASH_SEQ_LEN": "4",
+        }
+
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(diagnostic, "get_parallel", return_value=parallel),
+            patch.object(diagnostic.logger, "info") as info,
+        ):
+            self.assertTrue(
+                log_dsa_cache_hash_snapshot(
+                    stage="decode_post_receive",
+                    rid="sensitive-request-id",
+                    bootstrap_room=123,
+                    seq_len=4,
+                    global_slots=torch.tensor([4, 5, 6, 7]),
+                    pool=pool,
+                )
+            )
+
+        payloads = [json.loads(call.args[2]) for call in info.call_args_list]
+        self.assertEqual(len(payloads), 3)
+        slot_map = next(
+            payload for payload in payloads if payload["record_type"] == "slot_map"
+        )
+        layers = {
+            payload["component"]: payload
+            for payload in payloads
+            if payload["record_type"] == "layer_hash"
+        }
+        self.assertEqual(slot_map["owned_position_count"], 2)
+        self.assertEqual(layers["latent_kv"]["row_count"], 2)
+        self.assertEqual(layers["dsa_index_k"]["row_count"], 4)
+        self.assertEqual(layers["latent_kv"]["layer_id"], 4)
+        self.assertNotIn("sensitive-request-id", json.dumps(payloads))
+
+    def test_diagnostic_hooks_cover_the_three_transfer_boundaries_once(self):
+        hooks = (
+            ("disaggregation/prefill.py", "send_kv_chunk"),
+            ("disaggregation/mooncake/conn.py", "send_kvcache_dcp"),
+            ("disaggregation/decode.py", "pop_transferred"),
+        )
+
+        for relative_path, function_name in hooks:
+            with self.subTest(path=relative_path, function=function_name):
+                self.assertEqual(
+                    len(_function_calls(relative_path, function_name)),
+                    1,
+                )
+
+        prefill_call = _function_calls("disaggregation/prefill.py", "send_kv_chunk")[0]
+        decode_call = _function_calls("disaggregation/decode.py", "pop_transferred")[0]
+        prefill_keywords = {
+            keyword.arg: ast.unparse(keyword.value) for keyword in prefill_call.keywords
+        }
+        decode_keywords = {
+            keyword.arg: ast.unparse(keyword.value) for keyword in decode_call.keywords
+        }
+
+        self.assertEqual(
+            prefill_keywords["pool"],
+            "self.token_to_kv_pool_allocator.get_kvcache()",
+        )
+        self.assertEqual(
+            decode_keywords["global_slots"],
+            "self.scheduler.req_to_token_pool.req_to_token[decode_req.req."
+            "req_pool_idx, :seq_len]",
+        )
+        self.assertEqual(
+            decode_keywords["pool"],
+            "self.scheduler.token_to_kv_pool_allocator.get_kvcache()",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
