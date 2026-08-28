@@ -235,11 +235,13 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
             attn_dcp_size=1,
             attn_dcp_rank=0,
         )
-        positions = torch.tensor([0, 1], dtype=torch.int64)
+        positions = torch.tensor([0, 1, 0], dtype=torch.int64)
         tensors = {
-            "hidden_states": torch.tensor([[11, 12], [13, 14]], dtype=torch.int32),
+            "hidden_states": torch.tensor(
+                [[11, 12], [13, 14], [0, 0]], dtype=torch.int32
+            ),
             "residual": None,
-            "topk_indices": torch.tensor([[3], [4]], dtype=torch.int32),
+            "topk_indices": torch.tensor([[3], [4], [0]], dtype=torch.int32),
         }
 
         with (
@@ -259,6 +261,11 @@ class TestDcpCacheHashDiagnostic(unittest.TestCase):
         self.assertEqual(len(payloads), 3)
         by_component = {payload["component"]: payload for payload in payloads}
         self.assertEqual(by_component["hidden_states"]["row_count"], 2)
+        self.assertEqual(by_component["hidden_states"]["shape"], [2, 2])
+        self.assertEqual(
+            by_component["hidden_states"]["positions_sha256"],
+            hash_int_sequence([0, 1]),
+        )
         self.assertFalse(by_component["residual"]["present"])
         self.assertTrue(by_component["topk_indices"]["present"])
         self.assertNotIn("sensitive-request-id", json.dumps(payloads))

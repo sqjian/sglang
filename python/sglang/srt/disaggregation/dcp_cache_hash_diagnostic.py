@@ -250,10 +250,13 @@ def log_prefill_layer_hash_snapshot(
     tensors: dict[str, torch.Tensor | None],
 ) -> None:
     """Log content-free hashes for one Prefill layer boundary."""
-    if positions.ndim != 1 or positions.numel() != seq_len:
+    if positions.ndim != 1 or positions.numel() < seq_len:
         raise ValueError(
-            f"prefill layer hash needs {seq_len} positions, got {positions.shape}"
+            f"prefill layer hash needs at least {seq_len} positions, got {positions.shape}"
         )
+    # MLP-sync appends alignment rows after the request tokens. Compare only
+    # the logical sequence so the diagnostic does not hash padding state.
+    positions = positions[:seq_len]
 
     common = {
         "record_type": "prefill_layer_tensor_hash",
@@ -279,10 +282,11 @@ def log_prefill_layer_hash_snapshot(
                 }
             )
             continue
-        if tensor.ndim == 0 or tensor.shape[0] != seq_len:
+        if tensor.ndim == 0 or tensor.shape[0] < seq_len:
             raise ValueError(
-                f"prefill layer hash component {component!r} needs {seq_len} rows, got {tensor.shape}"
+                f"prefill layer hash component {component!r} needs at least {seq_len} rows, got {tensor.shape}"
             )
+        tensor = tensor[:seq_len]
         _emit(
             {
                 **common,
