@@ -4278,6 +4278,16 @@ class MLATokenToKVPool(KVCache):
             if _is_hcu:
                 from lightop import kvcache as op
 
+                parallel = get_parallel()
+                if parallel.dcp_enabled:
+                    # LightOp has no DCP owner/slot arguments, unlike the Triton
+                    # store kernel, so translate the widened locs before dispatch.
+                    valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+                    loc = loc[valid_mask] // parallel.attn_dcp_size
+                    if loc.numel() == 0:
+                        return
+                    cache_k_nope = cache_k_nope[valid_mask]
+                    cache_k_rope = cache_k_rope[valid_mask]
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope,
                     cache_k_rope,
