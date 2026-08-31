@@ -63,6 +63,42 @@ register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=46, suite="base-c-test-cpu")
 
 
+class TestBenchmarkClientImports(CustomTestCase):
+    def test_serving_import_does_not_require_disaggregation_runtime(self):
+        script = r"""
+import importlib.abc
+
+
+class BlockDisaggregationUtils(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "sglang.srt.disaggregation.utils":
+            raise ModuleNotFoundError(fullname)
+        return None
+
+
+import sys
+
+sys.meta_path.insert(0, BlockDisaggregationUtils())
+
+from sglang.benchmark.serving import (
+    FAKE_BOOTSTRAP_HOST,
+    resolve_base_url,
+    resolve_host_port,
+)
+
+assert FAKE_BOOTSTRAP_HOST == "2.2.2.2"
+assert resolve_base_url("", "::1", 30000) == "http://[::1]:30000"
+assert resolve_host_port("", "[::1]", 30000) == "[::1]:30000"
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class _DummyTokenTensor:
     def __init__(self, value: int):
         self.value = value
@@ -516,6 +552,52 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
+
+    def test_openai_sampler_normalizes_tool_call_arguments_for_tokenizer(self):
+        arguments = '{"sql": "SELECT 1"}'
+        record = {
+            "messages": [
+                {"role": "user", "content": "Query the database"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "query_database",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                },
+            ],
+            "max_tokens": 8,
+        }
+        path = self.tmpdir_path / "openai_tool_call.jsonl"
+        with open(path, "w") as f:
+            f.write(json.dumps(record) + "\n")
+
+        captured = {}
+
+        class ToolCallTokenizer:
+            def apply_chat_template(self, messages, **kwargs):
+                tool_arguments = messages[1]["tool_calls"][0]["function"]["arguments"]
+                captured["arguments"] = dict(tool_arguments.items())
+                return [1, 2, 3]
+
+        rows = sample_openai_requests(
+            dataset_path=str(path),
+            num_requests=1,
+            tokenizer=ToolCallTokenizer(),
+        )
+
+        self.assertEqual(captured["arguments"], {"sql": "SELECT 1"})
+        self.assertEqual(rows[0].prompt_len, 3)
+        self.assertEqual(
+            rows[0].prompt[1]["tool_calls"][0]["function"]["arguments"],
+            arguments,
+        )
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)

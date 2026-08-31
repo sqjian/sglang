@@ -48,8 +48,30 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
-from sglang.srt.utils.network import resolve_base_url, resolve_host_port
+
+try:
+    from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+    from sglang.srt.utils.network import resolve_base_url, resolve_host_port
+except ModuleNotFoundError:
+    # Client-only benchmark environments do not need the GPU runtime imported by
+    # sglang.srt. Keep the address helpers local when that runtime is unavailable.
+    FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+    def _wrap_host(host: str) -> str:
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        return f"[{host}]" if ":" in host else host
+
+    def resolve_base_url(base_url: str, host: str, port: int) -> str:
+        if base_url:
+            return base_url
+        return f"http://{_wrap_host(host)}:{port}"
+
+    def resolve_host_port(base_url: str, host: str, port: int) -> str:
+        if base_url:
+            return base_url
+        return f"{_wrap_host(host)}:{port}"
+
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 

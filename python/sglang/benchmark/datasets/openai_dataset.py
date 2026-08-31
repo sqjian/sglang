@@ -1,7 +1,8 @@
+import copy
 import json
 from argparse import Namespace
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
@@ -14,13 +15,20 @@ class OpenAIDataset(BaseDataset):
     dataset_path: str
     num_requests: int
     fixed_output_len: Optional[int]
+    extra_request_body: Dict[str, Any]
 
     @classmethod
     def from_args(cls, args: Namespace) -> "OpenAIDataset":
+        extra_request_body = (
+            json.loads(args.extra_request_body) if args.extra_request_body else {}
+        )
+        if not isinstance(extra_request_body, dict):
+            raise ValueError("--extra-request-body must be a JSON object")
         return cls(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             fixed_output_len=args.sharegpt_output_len,
+            extra_request_body=extra_request_body,
         )
 
     def load(
@@ -31,7 +39,100 @@ class OpenAIDataset(BaseDataset):
             num_requests=self.num_requests,
             tokenizer=tokenizer,
             fixed_output_len=self.fixed_output_len,
+            extra_request_body=self.extra_request_body,
         )
+
+
+def _normalize_tool_content(role: str, content: Any) -> Any:
+    if role != "tool" or not isinstance(content, list):
+        return content
+    if all(
+        (isinstance(part, dict) and part.get("type") == "text") or isinstance(part, str)
+        for part in content
+    ):
+        return " ".join(
+            part.get("text", "") if isinstance(part, dict) else part for part in content
+        )
+    return content
+
+
+def _normalize_messages_for_tokenizer(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized = copy.deepcopy(messages)
+    for message in normalized:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ValueError("OpenAI dataset message must contain a string role")
+        if message.get("content") is None:
+            message["content"] = ""
+        message["content"] = _normalize_tool_content(
+            message["role"], message.get("content")
+        )
+        if message["role"] != "assistant" or not isinstance(
+            message.get("tool_calls"), list
+        ):
+            continue
+        for tool_call in message["tool_calls"]:
+            try:
+                arguments = tool_call["function"].get("arguments")
+            except (KeyError, TypeError, AttributeError) as error:
+                raise ValueError("OpenAI dataset tool call is invalid") from error
+            if isinstance(arguments, str):
+                try:
+                    tool_call["function"]["arguments"] = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "OpenAI dataset tool call arguments are invalid JSON"
+                    ) from error
+    return normalized
+
+
+def _merge_request_body(
+    record_body: Dict[str, Any], global_body: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged = copy.deepcopy(record_body)
+    for key, value in global_body.items():
+        if key == "chat_template_kwargs" and isinstance(value, dict):
+            row_kwargs = merged.get(key, {})
+            if not isinstance(row_kwargs, dict):
+                raise ValueError("chat_template_kwargs must be an object")
+            merged[key] = {**row_kwargs, **copy.deepcopy(value)}
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _count_prompt_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: List[Dict[str, Any]],
+    extra_body: Dict[str, Any],
+) -> int:
+    normalized_messages = _normalize_messages_for_tokenizer(messages)
+    chat_template_kwargs = copy.deepcopy(extra_body.get("chat_template_kwargs", {}))
+    if not isinstance(chat_template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    tools = copy.deepcopy(extra_body.get("tools"))
+    template_kwargs = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "return_dict": False,
+        "tools": tools,
+        **chat_template_kwargs,
+    }
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            normalized_messages, **template_kwargs
+        )
+    except Exception:
+        if not tools:
+            raise
+        template_kwargs["tools"] = [tool.get("function", tool) for tool in tools]
+        input_ids = tokenizer.apply_chat_template(
+            normalized_messages, **template_kwargs
+        )
+    if not isinstance(input_ids, list):
+        raise ValueError("tokenizer chat template must return token ids")
+    return len(input_ids)
 
 
 def sample_openai_requests(
@@ -39,6 +140,7 @@ def sample_openai_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int] = None,
+    extra_request_body: Optional[Dict[str, Any]] = None,
 ) -> List[DatasetRow]:
     """
     Load OpenAI-compatible chat completion requests from a JSONL file.
@@ -51,61 +153,57 @@ def sample_openai_requests(
     - "top_p": optional top_p value
     - Other OpenAI API parameters are also extracted and passed through
     """
-    dataset = []
+    global_body = extra_request_body or {}
+    if not isinstance(global_body, dict):
+        raise ValueError("extra_request_body must be an object")
+    filtered_dataset: List[DatasetRow] = []
     with open(dataset_path, "r") as f:
         for line in f:
-            if num_requests > 0 and len(dataset) >= num_requests:
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            messages = data.get("messages")
+            if not isinstance(messages, list) or not messages:
+                continue
+            output_len = (
+                fixed_output_len
+                if fixed_output_len is not None
+                else data.get("max_tokens", data.get("max_completion_tokens", 256))
+            )
+            if (
+                isinstance(output_len, bool)
+                or not isinstance(output_len, int)
+                or output_len < 1
+            ):
+                raise ValueError(
+                    "OpenAI dataset output length must be a positive integer"
+                )
+            excluded_fields = {
+                "messages",
+                "max_tokens",
+                "max_completion_tokens",
+                "model",
+            }
+            record_body = {
+                key: value for key, value in data.items() if key not in excluded_fields
+            }
+            merged_body = _merge_request_body(record_body, global_body)
+            prompt_len = _count_prompt_tokens(tokenizer, messages, merged_body)
+            filtered_dataset.append(
+                DatasetRow(
+                    prompt=messages,
+                    prompt_len=prompt_len,
+                    output_len=output_len,
+                    extra_request_body=merged_body,
+                )
+            )
+            if num_requests > 0 and len(filtered_dataset) >= num_requests:
                 break
-            if line.strip():
-                try:
-                    dataset.append(json.loads(line))
-                except json.JSONDecodeError:
-                    # Skip invalid JSON lines
-                    continue
-
-    # Fields that should NOT be passed through extra_request_body
-    # These are either handled separately or are metadata
-    # max_tokens is excluded because it's handled via output_len -> max_completion_tokens
-    # max_completion_tokens is also excluded to avoid conflicts
-    EXCLUDED_FIELDS = {"messages", "max_tokens", "max_completion_tokens", "model"}
-
-    filtered_dataset: List[DatasetRow] = []
-    for data in dataset:
-        messages = data.get("messages", [])
-        if not messages:
-            continue
-
-        # Use max_tokens from the request, or fall back to fixed_output_len
-        output_len = fixed_output_len or data.get("max_tokens", 256)
-
-        # Extract extra request body parameters (tools, temperature, top_p, etc.)
-        extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
-
-        # Calculate prompt length by applying chat template
-        # This includes the messages but not the tools
-        prompt_len = len(
-            tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-        )
-
-        # If tools are present, we need to add their token count
-        # Tools are sent as part of the request and count toward input tokens
-        if "tools" in extra_body:
-            # Encode tools as JSON string to estimate token count
-            tools_str = json.dumps(extra_body["tools"])
-            tools_tokens = len(tokenizer.encode(tools_str))
-            prompt_len += tools_tokens
-
-        # Pass messages list directly - the serving benchmark handles List[Dict] prompts
-        filtered_dataset.append(
-            DatasetRow(
-                prompt=messages,
-                prompt_len=prompt_len,
-                output_len=output_len,
-                extra_request_body=extra_body,  # Store per-request parameters
-            )
-        )
 
     print(f"Loaded {len(filtered_dataset)} OpenAI-format requests")
     print(f"#Input tokens: {np.sum([x.prompt_len for x in filtered_dataset])}")
