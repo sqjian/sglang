@@ -170,6 +170,13 @@ def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
     return reasoning + (message.get("content") or "")
 
 
+def _openai_error_text(error: Any) -> str:
+    try:
+        return json.dumps(error, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(error)
+
+
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
@@ -484,6 +491,7 @@ async def async_request_openai_chat_completions(
         generated_text = ""
         output_len = request_func_input.output_len
         ttft = 0.0
+        saw_valid_choice = False
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
@@ -542,9 +550,16 @@ async def async_request_openai_chat_completions(
                                 if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
 
-                                choices = data.get("choices") or []
-                                if not choices:
+                                if "error" in data and data["error"] is not None:
+                                    output.error = _openai_error_text(data["error"])
+                                    break
+
+                                choices = data.get("choices")
+                                if not isinstance(choices, list) or not choices:
                                     continue
+                                if not isinstance(choices[0], dict):
+                                    continue
+                                saw_valid_choice = True
 
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
@@ -569,9 +584,17 @@ async def async_request_openai_chat_completions(
                                     generated_text += content
 
                         output.generated_text = generated_text
-                        output.success = True
                         output.latency = latency
                         output.output_len = output_len
+                        if output.error:
+                            output.success = False
+                        elif not saw_valid_choice:
+                            output.success = False
+                            output.error = (
+                                "Streaming response ended without a valid choice."
+                            )
+                        else:
+                            output.success = True
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())

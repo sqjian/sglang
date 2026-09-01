@@ -2,9 +2,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -17,10 +22,28 @@ class TestPDDecodeDCPTopology(unittest.TestCase):
         scheduler.server_args = SimpleNamespace(enable_dp_attention=True, dp_size=4)
         scheduler.require_mlp_sync = True
         scheduler.ps = SimpleNamespace(
-            pp_size=1, attn_tp_size=8, attn_cp_size=1, tp_rank=0
+            pp_size=1,
+            attn_tp_size=8,
+            attn_cp_size=1,
+            attn_dcp_size=8,
+            tp_rank=0,
         )
         scheduler.tp_group = SimpleNamespace(ranks=list(range(32)))
         return scheduler
+
+    def test_logical_kv_capacity_scales_physical_pool_once_for_dcp8(self):
+        scheduler = self._new_scheduler()
+        scheduler.max_total_num_tokens = 147_584
+
+        with get_parallel().override(attn_dcp_size=8):
+            self.assertEqual(scheduler.logical_max_total_num_tokens, 1_180_672)
+
+    def test_logical_kv_capacity_keeps_dcp1_unchanged(self):
+        scheduler = self._new_scheduler()
+        scheduler.max_total_num_tokens = 147_584
+
+        with get_parallel().override(attn_dcp_size=1):
+            self.assertEqual(scheduler.logical_max_total_num_tokens, 147_584)
 
     def test_stepinfo_sync_is_disabled_by_default(self):
         self.assertFalse(envs.SGLANG_ENABLE_PD_DECODE_STEPINFO_SYNC.default)

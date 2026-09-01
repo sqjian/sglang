@@ -224,6 +224,51 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
 
+    def test_error_only_stream_is_failure(self):
+        out = self._run(
+            [
+                {
+                    "error": {
+                        "message": "Request exceeds logical KV capacity",
+                        "type": "BadRequest",
+                        "code": 400,
+                    }
+                }
+            ]
+        )
+
+        self.assertFalse(out.success)
+        self.assertIn("logical KV capacity", out.error)
+
+    def test_stream_error_takes_priority_after_valid_choice(self):
+        out = self._run(
+            [
+                _make_chunk(content="partial"),
+                {
+                    "error": {
+                        "message": "Decode admission failed",
+                        "type": "InternalServerError",
+                        "code": 500,
+                    }
+                },
+            ]
+        )
+
+        self.assertFalse(out.success)
+        self.assertIn("Decode admission failed", out.error)
+
+    def test_empty_choices_only_stream_is_failure(self):
+        out = self._run([{"choices": []}])
+
+        self.assertFalse(out.success)
+        self.assertIn("valid choice", out.error)
+
+    def test_usage_only_stream_is_failure(self):
+        out = self._run([{"choices": [], "usage": {"completion_tokens": 0}}])
+
+        self.assertFalse(out.success)
+        self.assertIn("valid choice", out.error)
+
     def test_content_only_stream_unchanged(self):
         chunks = [
             _make_chunk(content="hi "),

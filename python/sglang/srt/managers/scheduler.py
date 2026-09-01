@@ -400,6 +400,14 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    def dcp_logical_token_capacity(self, per_rank_capacity: int) -> int:
+        """Convert one rank's physical KV capacity to the DCP address space."""
+        return per_rank_capacity * get_parallel().attn_dcp_size
+
+    @property
+    def logical_max_total_num_tokens(self) -> int:
+        return self.dcp_logical_token_capacity(self.max_total_num_tokens)
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1510,6 +1518,7 @@ class Scheduler(
                 gpu_id=self.ps.gpu_id,
                 bootstrap_port=get_disagg().disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
+                logical_max_total_num_tokens=self.logical_max_total_num_tokens,
                 pp_rank=self.ps.pp_rank,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
@@ -2383,7 +2392,7 @@ class Scheduler(
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self.logical_max_total_num_tokens
                 - paged_input_len
                 - self.page_size
                 - 1,

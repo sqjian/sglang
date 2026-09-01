@@ -2239,7 +2239,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR.value
 
         async def _mock_generate_abort():
             yield {
@@ -2247,7 +2247,20 @@ class ServingChatTestCase(unittest.TestCase):
                 "meta_info": {
                     "id": "chatcmpl-test",
                     "prompt_tokens": 10,
-                    "completion_tokens": 2,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
                     "cached_tokens": 0,
                     "finish_reason": {
                         "type": "abort",
@@ -2303,15 +2316,58 @@ class ServingChatTestCase(unittest.TestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code)
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
         # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        self.assertGreaterEqual(len(chunks), 4)
+        self.assertIn("error", chunks[-2])
+
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        err_msg = "Request exceeds logical KV capacity"
+        err_code = HTTPStatus.BAD_REQUEST.value
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 1_048_577,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+        adapted_request = Mock()
+        with (
+            patch.object(self.chat, "_validate_request", return_value=None),
+            patch.object(
+                self.chat,
+                "_convert_to_internal_request",
+                return_value=(adapted_request, self.stream_req),
+            ),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(self.stream_req, self.fastapi_request)
+            )
+
+        self.assertEqual(response.status_code, err_code)
+        error = json.loads(response.body)
+        self.assertEqual(error["message"], err_msg)
+        self.assertEqual(error["code"], err_code)
+        self.tm.create_abort_task.assert_not_called()
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

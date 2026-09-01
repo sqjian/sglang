@@ -20,7 +20,7 @@ class ThinkingMode(str, Enum):
 
 import jinja2
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 try:
     from mistral_common.exceptions import MistralCommonException
@@ -1629,14 +1629,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    status_code = finish_reason.get("status_code")
+                    if (
+                        finish_reason_type == "abort"
+                        and isinstance(status_code, int)
+                        and not isinstance(status_code, bool)
                     ):
-                        code = finish_reason["status_code"]
+                        code = int(status_code)
+                        message = finish_reason.get("message", "Generation aborted.")
+                        if not stream_started:
+                            raise HTTPException(status_code=code, detail=message)
+                        try:
+                            error_type = HTTPStatus(code).name
+                        except ValueError:
+                            error_type = "GenerationError"
                         error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            message,
+                            error_type,
+                            code,
                         )
                         yield f"data: {error}\n\n"
                         break

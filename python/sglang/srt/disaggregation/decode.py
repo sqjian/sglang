@@ -348,6 +348,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
+        logical_max_total_num_tokens: int,
         pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
@@ -371,6 +372,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
+        self.logical_max_total_num_tokens = logical_max_total_num_tokens
         self.pp_rank = pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
@@ -415,6 +417,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
+            self.logical_max_total_num_tokens = min(
+                self.logical_max_total_num_tokens,
+                self.scheduler.dcp_logical_token_capacity(
+                    self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens
+                ),
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
@@ -878,7 +886,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.enable_hisparse:
             capacity = self.scheduler.tp_worker.model_runner.max_token_pool_size
         else:
-            capacity = self.max_total_num_tokens
+            capacity = self.logical_max_total_num_tokens
         input_len = self._rebootstrap_prefill_len(req)
         if input_len > capacity:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {input_len} > {capacity}"
