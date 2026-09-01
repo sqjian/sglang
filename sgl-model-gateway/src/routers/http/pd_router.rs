@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -533,9 +536,7 @@ impl PDRouter {
             let response_headers = header_utils::preserve_response_headers(res.headers());
             let error_payload = match res.bytes().await {
                 Ok(error_body) => match serde_json::from_slice::<Value>(&error_body) {
-                    Ok(error_json) => {
-                        json!({ "message": error_json, "status": status.as_u16() })
-                    }
+                    Ok(error_json) => error_json.get("error").cloned().unwrap_or(error_json),
                     Err(parse_err) => {
                         let body_text = String::from_utf8_lossy(&error_body).to_string();
                         let preview: String = body_text.chars().take(256).collect();
@@ -555,10 +556,7 @@ impl PDRouter {
                 }
             };
 
-            let sse_data = format!(
-                "data: {{'error': {}}}",
-                serde_json::to_string(&error_payload).unwrap_or_default()
-            );
+            let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
             let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
 
             self.create_streaming_response(
@@ -1207,6 +1205,10 @@ impl PDRouter {
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
+        // The response body is streamed through a new Axum body and can be
+        // transformed (for example by logprob merging or a synthetic error
+        // event), so an upstream entity length no longer describes it.
+        response_headers.remove(CONTENT_LENGTH);
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 

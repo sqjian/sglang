@@ -9,7 +9,10 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        StatusCode,
+    },
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -2129,6 +2132,75 @@ mod upstream_cancel_tests {
             f_post_prefill
         );
 
+        ctx.shutdown().await;
+    }
+
+    /// PD decode errors for streaming requests are synthesized by the Router,
+    /// so upstream entity headers must not describe the replacement body and
+    /// the SSE data field must contain complete, valid JSON.
+    #[tokio::test]
+    async fn test_pd_decode_streaming_4xx_returns_complete_valid_sse_error() {
+        let prefill_port = 20315;
+        let decode_port = 20316;
+        set_fail_status_code(decode_port, 400);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4315)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![TestWorkerConfig::prefill(prefill_port), {
+                let mut w = TestWorkerConfig::decode(decode_port);
+                w.fail_rate = 1.0;
+                w
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({ "text": "x", "stream": true });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert!(
+            !resp.headers().contains_key(CONTENT_LENGTH),
+            "synthetic streaming body must not retain upstream content-length"
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.ends_with("\n\n"), "SSE event must be terminated");
+        let data = body
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("response must be exactly one SSE data event");
+        let error: serde_json::Value =
+            serde_json::from_str(data).expect("SSE data must be complete JSON");
+        assert_eq!(error["error"], "Random failure for testing");
+
+        clear_fail_status_code(decode_port);
         ctx.shutdown().await;
     }
 
